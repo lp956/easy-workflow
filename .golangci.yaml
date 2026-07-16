@@ -1,0 +1,234 @@
+version: "2"
+
+run:
+  concurrency: 0   # 0 = 按 CPU/cgroup 配额自适应（CI 友好）
+  timeout: 5m
+  tests: true   # 含测试文件一起扫（再用 exclude-rules 豁免重型/风格类检查）
+
+# ============================================================
+# linters —— default: none，仅启用高价值检查器
+#   保留原则：抓真实 bug / 安全 / 规范，近零误报；
+#   风格噪音（revive / wsl_v5 / paralleltest / godot / dupword
+#   / goconst / thelper / gocritic 等）一律不启用。
+#   v2 合并档：在「可用档」基础上增量加入候选的高价值低噪音项
+#   （errchkjson / nilnil / unconvert / usestdlibvars / wastedassign
+#   / reassign / makezero / contextcheck / sloglint / nolintlint）。
+# ============================================================
+linters:
+  default: none
+  enable:
+    # ---------- 正确性 ----------
+    - govet            # 内置 vet：copylocks / printf / 结构体 tag / 不可达代码
+    - staticcheck      # 最强静态分析（SA/ST 系列），性价比最高
+    - unused           # 未使用的变量/函数/类型，零误报
+    - ineffassign      # 赋值后从未读取（死代码）
+    - errcheck         # 未检查的 error 返回值（类型断言已关，见 settings）
+    - errorlint        # 要求 errors.Is/As 与 %w 包装（Go 1.13+ 规范）
+    - nilerr           # err 非 nil 却返回 nil，抓真实逻辑 bug
+    - nilnil           # 同时返回 nil, nil（应 nil, err 或 err, nil）
+    - forcetypeassert  # 无 comma-ok 的裸类型断言（可能 panic）
+    - predeclared      # 遮蔽 Go 内建（len/cap/error 等）
+    - asciicheck       # 非 ASCII 标识符（防 homoglyph / 木马源码）
+    - durationcheck     # time.Duration * time.Duration 维度错误（罕见但致命）
+    - errchkjson        # json.Marshal 入参类型检查（真实序列化 bug）
+    - unconvert         # 不必要的类型转换
+    - usestdlibvars     # 使用标准库常量（http.StatusOK 代替 200）
+    - wastedassign      # 被立即覆盖的无效赋值
+    - reassign          # 包级变量被重新赋值
+    - makezero          # 切片声明带非零初始长度
+    - contextcheck      # context 未沿调用链传递
+    - nolintlint        # //nolint 规范性：必须指定具体 linter + 说明理由（见 settings）
+    - errname           # 错误变量命名须 err / Err 前缀（一致性）
+    - gocheckcompilerdirectives # //go:build / //go:linkname 等编译器指令语法校验
+    - goprintffuncname   # printf 类函数须以 f 结尾（fmt.Sprintf 风格）
+    - gomoddirectives    # 禁止 go.mod 随意 replace/exclude（依赖治理）
+    - canonicalheader    # HTTP 头键名须规范（Content-Type 而非 content-type）
+    - musttag           # 参与序列化的结构体须带 json/yaml/xml/toml/mapstructure tag
+
+    # ---------- 复杂度 ----------
+    - gocyclo          # 圈复杂度，阈值已调高到 20（见 settings）
+    - nestif           # 深层嵌套 if/else，阈值已放宽到 8（见 settings）
+    - funlen           # 函数过长，测试已豁免（见 exclude-rules）
+
+    # ---------- 性能 / 资源 ----------
+    - bodyclose        # 未关闭 HTTP 响应体（连接泄漏）
+    - sqlclosecheck    # 未关闭 sql.Rows / sql.Stmt
+    - rowserrcheck     # 迭代后未检查 sql.Rows.Err()
+    - fatcontext       # 循环内 WithValue/WithCancel（context 链无限增长，内存泄漏）
+    - noctx            # HTTP 请求缺 context.Context，CLI/测试已豁免（见 exclude-rules）
+
+    # ---------- 安全 ----------
+    - gosec            # 安全扫描（SQL 注入/硬编码凭证/弱加密/路径穿越）；G104 由 presets.std-error-handling 覆盖，不再显式重复
+    - bidichk          # 双向 Unicode 控制字符（CVE-2021-42574）
+
+    # ---------- 治理 / 护栏 ----------
+    - forbidigo        # 禁 panic / fmt.Println 等生产代码禁止项；cmd/apitest 与测试已豁免（见 exclusions）
+    - godox            # TODO/FIXME/BUG/XXX 显式标注技术债，防止无声堆积
+    - gochecknoinits   # 禁 func init()；docs/（swag 自动生成）已豁免（见 exclusions）
+
+    # ---------- 风格护栏 ----------
+    - lll              # 行宽上限 140（见 settings），测试已豁免
+
+    # ---------- 现代化 / 元 ----------
+    - modernize        # 可换成新版 Go 特性的旧写法
+    - intrange         # 整数 range 替代 C 式循环（Go 1.22+）
+    - exhaustive       # switch 未覆盖所有枚举值（default-signifies-exhaustive: false）
+    - usetesting        # 现代测试写法（t.Context() / tb.TempDir() / os-setenv，Go 1.24+）
+
+    # ---------- 诊断 / 代码质量（gocritic 精选子集） ----------
+    - gocritic         # 仅启用 diagnostic+performance 子集（见 settings.gocritic），排除签名变更/纯风格类
+
+    # ---------- 日志 ----------
+    - sloglint         # log/slog 使用一致性（项目已在 14 个文件使用 slog）
+    # - unparam
+
+  # ============================================================
+  # settings —— 各检查器参数（含中文说明）
+  # ============================================================
+  settings:
+    errcheck:
+      # 类型断言不检查（x.(T) 未接），消除大量噪音；仍保留真正的 err 未检查
+      check-type-assertions: false
+      # 仅保留「写 stdout/stderr 不可恢复」的社区标准豁免。
+      # 已移除 io.Copy / (io.Writer).Write 等宽泛豁免：io.Copy 本项目未使用；
+      # Write 类错误应显式处理，或按调用点写 //nolint:errcheck // 原因（nolintlint 强制）。
+      exclude-functions:
+        - 'fmt.Fprint*'
+        - 'fmt.Print*'
+    funlen:
+      lines: 120       # 函数超 120 行报错（测试豁免）
+      statements: 80    # 函数超 80 语句报错
+    gocyclo:
+      min-complexity: 20   # 13 → 20，业务方法常超 13
+    nestif:
+      min-complexity: 8     # 5 → 8，降低对合理 early-return 的干扰
+    exhaustive:
+      default-signifies-exhaustive: false   # 即便有 default 也要求显式枚举所有 case
+    sloglint:
+      no-mixed-args: true      # 禁止混合传参方式
+      kv-only: false           # 不强制仅键值对
+      attr-only: false         # 不强制仅 attr
+      no-global: ""            # 不强制禁用全局 logger
+      context: ""              # 不强制要求 context 参数
+      static-msg: false        # 不强制静态消息
+      key-naming-case: snake   # 键名命名风格 snake_case
+    nolintlint:
+      require-explanation: true   # //nolint 必须写原因
+      require-specific: true      # //nolint 必须指定具体 linter，禁止 //nolint:lint
+    gocritic:
+      # 仅启用行为不变、低噪音的 diagnostic+performance 检查；
+      # 排除 hugeParam / paramTypeCombine（会强制改签名）、captLocal / yodaStyleExpr（纯风格）。
+      enable-all: false
+      enabled-checks:
+        - emptyStringTest
+        - nilValReturn
+        - octalLiteral
+        - sloppyReassign
+        - sqlQuery
+        - typeAssertChain
+        - weakCond
+        - rangeExprCopy
+        - indexAlloc
+        - stringXbytes
+        - unnecessaryBlock
+    lll:
+      line-length: 160
+      tab-width: 4
+    forbidigo:
+      forbid:
+        - pattern: '^(fmt\.Print(|ln|f)|print|println)$'
+          msg: 'use slog for logging instead of fmt.Print* in production code'
+        - pattern: '^panic$'
+          msg: 'use returned error or log.Fatal instead of panic'
+    # musttag 使用内置默认 tag 集（json/xml/yaml/toml），无需额外设置。
+
+  # ============================================================
+  # 路径豁免
+  #   - 测试文件：仅豁免复杂度/风格类，保留 errcheck/gosec/staticcheck
+  #     抓真实问题（测试里的 bug 同样是 bug）
+  #   - cmd/ ：生产入口 cmd/server 必须接受 errcheck/gosec/staticcheck；
+  #     仅对启动期 net/http 无 context 的 noctx 豁免（bootstrap 不可回避）
+  # ============================================================  
+  exclusions:
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling    # 覆盖 gosec G104 等标准错误处理豁免
+    generated: strict
+    warn-unused: true          # 某条 exclude 规则匹配不到任何文件时告警（抓死规则）
+    rules:
+      - path: _test\.go
+        linters:
+          - funlen
+          - nestif
+          - gocyclo
+          - exhaustive
+          - noctx
+          - forbidigo
+          - lll
+      - path: cmd/
+        linters:
+          - noctx
+      - path: cmd/apitest/
+        linters:
+          - forbidigo
+      - path: docs/
+        linters:
+          - gochecknoinits
+
+# ============================================================
+# formatters —— gofmt + goimports + gci（真实 module 路径）
+#   启用 goimports/gci 可正确管理导入分组，避免 --fix 改写
+#   errorlint/staticcheck 时漏补 import（此前曾踩坑）。
+#   注意：启用后会报告导入分组 findings，可 `golangci-lint run --fix` 一次性修复。
+# ============================================================
+formatters:
+  enable:
+    - gofmt
+    - goimports
+    - gci
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/ipmp/ipmp
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/ipmp/ipmp)
+  exclusions:
+    generated: strict
+    warn-unused: true          # 导入分组豁免若匹配不到文件则告警
+
+# ============================================================
+# output —— 输出格式（v2 新增段）
+# ============================================================
+output:
+  formats:
+    text:
+      path: stdout
+      colors: true
+      print-linter-name: true
+      print-issued-lines: true
+  sort-order:
+    - linter
+    - file
+  show-stats: true
+  path-prefix: ""
+
+# ============================================================
+# issues —— 限度与路径豁免
+# ============================================================
+issues:
+  max-issues-per-linter: 0  # 0 = 不限，看到全部
+  max-same-issues: 50
+
+# ============================================================
+# severity —— 严重度（默认不提升，CI 失败策略按需扩展）
+# ============================================================
+severity:
+  default: ""
+  rules: []
