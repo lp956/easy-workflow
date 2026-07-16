@@ -16,8 +16,14 @@ const (
 	KindEnd = "end"
 )
 
-// ErrInvalidDefinition identifies a malformed or internally inconsistent workflow graph.
-var ErrInvalidDefinition = errors.New("workflow: invalid definition")
+var (
+	// ErrInvalidDefinition identifies a malformed or internally inconsistent workflow graph.
+	ErrInvalidDefinition = errors.New("workflow: invalid definition")
+	// ErrAmbiguousRoute identifies one node outcome that selects more than one target.
+	ErrAmbiguousRoute = errors.New("workflow: ambiguous route")
+	// ErrRouteNotFound identifies an outcome for which the current node declares no target.
+	ErrRouteNotFound = errors.New("workflow: route not found")
+)
 
 // Definition is the canonical, JSON-serializable workflow graph.
 //
@@ -214,8 +220,10 @@ func (d *Definition) Validate() error {
 		selector := edgeSelector{source: edge.From, outcome: edge.Outcome}
 		if _, exists := selectors[selector]; exists {
 			return fmt.Errorf(
-				"%w: node %q outcome %q selects multiple targets",
+				"%w: %w: definition %q node %q outcome %q selects multiple targets",
 				ErrInvalidDefinition,
+				ErrAmbiguousRoute,
+				d.ID,
 				edge.From,
 				edge.Outcome,
 			)

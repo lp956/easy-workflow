@@ -47,23 +47,21 @@ func (e *Engine) Start(ctx context.Context, definition *Definition, request Star
 	if request.ID == "" || request.Initiator == "" || !validJSON(request.Data) {
 		return nil, fmt.Errorf("workflow: start: id, initiator, or data is invalid")
 	}
-	if err := definition.Validate(); err != nil {
-		return nil, err
-	}
-	if err := e.validateHandlers(definition); err != nil {
+	plan, err := compileDefinition(definition, e.registry)
+	if err != nil {
 		return nil, err
 	}
 
-	// Freeze definition and business data before executing so caller mutation cannot alter the new instance.
+	// Use the compiler-owned snapshot so caller mutation cannot invalidate the execution plan or new instance.
 	instance := &Instance{
 		ID:         request.ID,
-		Definition: cloneDefinition(*definition),
+		Definition: cloneDefinition(plan.definition),
 		Status:     InstanceStatusRunning,
 		Initiator:  request.Initiator,
 		Data:       slices.Clone(request.Data),
 		Version:    1,
 	}
-	start, err := findNodeByKind(&instance.Definition, KindStart)
+	start, err := plan.startNode()
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +69,7 @@ func (e *Engine) Start(ctx context.Context, definition *Definition, request Star
 	e.appendAudit(instance, AuditRecord{Action: "instance.started", NodeID: start.ID, ActorID: request.Initiator})
 
 	// Start nodes are control-only, so execution immediately follows their unconditional outgoing edge.
-	if err := e.advance(ctx, instance, ""); err != nil {
+	if err := e.advance(ctx, instance, plan, ""); err != nil {
 		return nil, err
 	}
 	if err := e.store.Create(ctx, instance); err != nil {
@@ -103,8 +101,12 @@ func (e *Engine) Handle(ctx context.Context, command Command) (*Instance, error)
 	if instance.Status != InstanceStatusRunning {
 		return nil, fmt.Errorf("%w: instance is %q", ErrInvalidCommand, instance.Status)
 	}
+	plan, err := compileDefinition(&instance.Definition, e.registry)
+	if err != nil {
+		return nil, err
+	}
 	expectedVersion := instance.Version
-	node, err := findNode(&instance.Definition, instance.CurrentNodeID)
+	node, err := plan.node(instance.CurrentNodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +133,7 @@ func (e *Engine) Handle(ctx context.Context, command Command) (*Instance, error)
 		TaskID:  command.TaskID,
 		ActorID: command.ActorID,
 	})
-	if err := e.applyResult(ctx, instance, node, result); err != nil {
+	if err := e.applyResult(ctx, instance, plan, node, result); err != nil {
 		return nil, err
 	}
 	instance.Version++
@@ -141,30 +143,13 @@ func (e *Engine) Handle(ctx context.Context, command Command) (*Instance, error)
 	return cloneInstance(instance), nil
 }
 
-// validateHandlers verifies every business node configuration before any instance state is created.
-func (e *Engine) validateHandlers(definition *Definition) error {
-	for _, node := range definition.Nodes {
-		if node.Kind == KindStart || node.Kind == KindEnd {
-			continue
-		}
-		handler, err := e.registry.handler(node.Kind)
-		if err != nil {
-			return err
-		}
-		if err := handler.Validate(node.Config); err != nil {
-			return fmt.Errorf("%w: node %q: %w", ErrInvalidDefinition, node.ID, err)
-		}
-	}
-	return nil
-}
-
 // advance follows one declared outcome and activates control or business nodes until execution must wait or ends.
-func (e *Engine) advance(ctx context.Context, instance *Instance, outcome string) error {
+func (e *Engine) advance(ctx context.Context, instance *Instance, plan *compiledDefinition, outcome string) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("workflow: advance instance: %w", err)
 		}
-		next, err := nextNode(&instance.Definition, instance.CurrentNodeID, outcome)
+		next, err := plan.nextNode(instance.CurrentNodeID, outcome)
 		if err != nil {
 			return err
 		}
@@ -211,7 +196,13 @@ func (e *Engine) advance(ctx context.Context, instance *Instance, outcome string
 }
 
 // applyResult validates one command result, replaces current tasks, and performs its requested disposition.
-func (e *Engine) applyResult(ctx context.Context, instance *Instance, node *NodeDefinition, result NodeResult) error {
+func (e *Engine) applyResult(
+	ctx context.Context,
+	instance *Instance,
+	plan *compiledDefinition,
+	node *NodeDefinition,
+	result NodeResult,
+) error {
 	if err := e.applyNodeTasks(instance, node.ID, result.Tasks, true); err != nil {
 		return err
 	}
@@ -220,7 +211,7 @@ func (e *Engine) applyResult(ctx context.Context, instance *Instance, node *Node
 	case DispositionWaiting:
 		return nil
 	case DispositionContinue:
-		return e.advance(ctx, instance, result.Outcome)
+		return e.advance(ctx, instance, plan, result.Outcome)
 	case DispositionReject:
 		instance.Status = InstanceStatusRejected
 		e.appendAudit(instance, AuditRecord{Action: "instance.rejected", NodeID: node.ID})
@@ -280,44 +271,6 @@ func (e *Engine) applyNodeTasks(instance *Instance, nodeID string, tasks []Task,
 func (e *Engine) appendAudit(instance *Instance, record AuditRecord) {
 	record.At = time.Now().UTC()
 	instance.Audit = append(instance.Audit, record)
-}
-
-// findNodeByKind returns the single node matching kind after definition validation.
-func findNodeByKind(definition *Definition, kind string) (*NodeDefinition, error) {
-	for i := range definition.Nodes {
-		if definition.Nodes[i].Kind == kind {
-			return &definition.Nodes[i], nil
-		}
-	}
-	return nil, fmt.Errorf("%w: node kind %q not found", ErrInvalidDefinition, kind)
-}
-
-// findNode returns the node with id or an invalid-definition error for a corrupted snapshot.
-func findNode(definition *Definition, id string) (*NodeDefinition, error) {
-	for i := range definition.Nodes {
-		if definition.Nodes[i].ID == id {
-			return &definition.Nodes[i], nil
-		}
-	}
-	return nil, fmt.Errorf("%w: node %q not found", ErrInvalidDefinition, id)
-}
-
-// nextNode selects exactly one declared edge for source and outcome.
-func nextNode(definition *Definition, source, outcome string) (*NodeDefinition, error) {
-	var target string
-	for _, edge := range definition.Edges {
-		if edge.From != source || edge.Outcome != outcome {
-			continue
-		}
-		if target != "" {
-			return nil, fmt.Errorf("%w: node %q outcome %q is ambiguous", ErrInvalidDefinition, source, outcome)
-		}
-		target = edge.To
-	}
-	if target == "" {
-		return nil, fmt.Errorf("%w: node %q has no edge for outcome %q", ErrInvalidDefinition, source, outcome)
-	}
-	return findNode(definition, target)
 }
 
 // tasksForNode returns a defensive copy of every historical or current task owned by nodeID.
