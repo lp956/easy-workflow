@@ -268,6 +268,34 @@ func TestCompileDefinitionGraphErrorIdentifiesDefinition(t *testing.T) {
 	}
 }
 
+// TestCompileDefinitionRejectsMissingStartRoute verifies the control entry has its required unconditional edge.
+func TestCompileDefinitionRejectsMissingStartRoute(t *testing.T) {
+	t.Parallel()
+
+	// A named start outcome is structurally connected but cannot be selected by Engine startup semantics.
+	definition := &workflow.Definition{
+		ID: "missing-start-route",
+		Nodes: []workflow.NodeDefinition{
+			{ID: "start", Kind: workflow.KindStart},
+			{ID: "end", Kind: workflow.KindEnd},
+		},
+		Edges: []workflow.Edge{
+			{From: "start", To: "end", Outcome: "unexpected"},
+		},
+	}
+
+	// Compilation rejects the absent unconditional selector before an Engine can create state.
+	err := workflow.CompileDefinition(definition, workflow.NewRegistry())
+	if !errors.Is(err, workflow.ErrInvalidDefinition) || !errors.Is(err, workflow.ErrRouteNotFound) {
+		t.Fatalf("CompileDefinition() error = %v, want ErrInvalidDefinition and ErrRouteNotFound", err)
+	}
+	if !strings.Contains(err.Error(), `definition "missing-start-route"`) ||
+		!strings.Contains(err.Error(), `node "start"`) ||
+		!strings.Contains(err.Error(), `outcome ""`) {
+		t.Errorf("CompileDefinition() error = %v, want definition, start node, and empty outcome context", err)
+	}
+}
+
 // TestEngineStartDoesNotPersistCompileFailure verifies invalid definitions cannot create Instance state.
 func TestEngineStartDoesNotPersistCompileFailure(t *testing.T) {
 	t.Parallel()

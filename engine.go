@@ -143,7 +143,11 @@ func (e *Engine) Handle(ctx context.Context, command Command) (*Instance, error)
 	return cloneInstance(instance), nil
 }
 
-// advance follows one declared outcome and activates control or business nodes until execution must wait or ends.
+// advance follows compiled routes and activates nodes until execution waits or reaches a terminal state.
+//
+// instance is the caller-owned aggregate being prepared for one atomic Store write. plan must be compiled
+// from instance.Definition, and outcome selects the first route; an empty outcome is unconditional. Handler
+// or routing errors leave durable state unchanged because callers persist only after this method succeeds.
 func (e *Engine) advance(ctx context.Context, instance *Instance, plan *compiledDefinition, outcome string) error {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -195,7 +199,11 @@ func (e *Engine) advance(ctx context.Context, instance *Instance, plan *compiled
 	}
 }
 
-// applyResult validates one command result, replaces current tasks, and performs its requested disposition.
+// applyResult validates and applies one handler result to the caller-owned aggregate.
+//
+// plan and node must belong to instance.Definition. Waiting replaces current tasks, continue advances by
+// result.Outcome, and reject terminates without routing. Errors prevent the enclosing Handle operation from
+// saving the mutated snapshot; this method performs no Store I/O itself.
 func (e *Engine) applyResult(
 	ctx context.Context,
 	instance *Instance,

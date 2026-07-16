@@ -14,10 +14,14 @@ var ErrInvalidNodeConfig = errors.New("workflow: invalid node config")
 // compiledDefinition owns a frozen Definition and its deterministic node and outcome lookup indexes.
 // It is immutable after construction and safe for concurrent reads within one Engine operation.
 type compiledDefinition struct {
+	// definition is the canonical snapshot whose slice order remains available for persistence compatibility.
 	definition Definition
-	startID    string
-	nodes      map[string]int
-	routes     map[edgeSelector]string
+	// startID identifies the single control entry validated for unconditional routing.
+	startID string
+	// nodes maps each stable node ID to its position in definition.Nodes without exposing the index publicly.
+	nodes map[string]int
+	// routes maps a source-and-outcome selector to its single validated target node ID.
+	routes map[edgeSelector]string
 }
 
 // CompileDefinition performs complete graph and registered-handler validation without persisting state.
@@ -36,6 +40,7 @@ func CompileDefinition(definition *Definition, registry *Registry) error {
 // The returned plan owns all mutable Definition data. registry is read only during compilation; missing
 // handlers and invalid handler configuration fail before a plan is returned.
 func compileDefinition(definition *Definition, registry *Registry) (*compiledDefinition, error) {
+	// Reject malformed canonical data before consulting handlers or allocating a usable plan.
 	if err := definition.Validate(); err != nil {
 		definitionID := ""
 		if definition != nil {
@@ -58,11 +63,12 @@ func compileDefinition(definition *Definition, registry *Registry) (*compiledDef
 		plan.nodes[node.ID] = index
 		if node.Kind == KindStart {
 			plan.startID = node.ID
-			continue
+			continue // Control nodes have no registered handler configuration contract.
 		}
 		if node.Kind == KindEnd {
-			continue
+			continue // Terminal control nodes likewise require no handler lookup.
 		}
+		// Reject malformed raw bytes before a handler attempts schema-specific decoding.
 		if len(node.Config) > 0 && !json.Valid(node.Config) {
 			return nil, fmt.Errorf(
 				"%w: %w: definition %q node %q config is not valid json",
@@ -73,9 +79,17 @@ func compileDefinition(definition *Definition, registry *Registry) (*compiledDef
 			)
 		}
 		handler, err := registry.handler(node.Kind)
+		// A missing handler makes the node non-executable regardless of graph validity.
 		if err != nil {
-			return nil, fmt.Errorf("%w: definition %q node %q: %w", ErrInvalidDefinition, frozen.ID, node.ID, err)
+			return nil, fmt.Errorf(
+				"%w: definition %q node %q: %w",
+				ErrInvalidDefinition,
+				frozen.ID,
+				node.ID,
+				err,
+			)
 		}
+		// Apply the owning handler's complete schema and business-rule validation before execution.
 		if err := handler.Validate(node.Config); err != nil {
 			return nil, fmt.Errorf(
 				"%w: %w: definition %q node %q config: %w",
@@ -91,6 +105,17 @@ func compileDefinition(definition *Definition, registry *Registry) (*compiledDef
 	// Materialize outcome routing once; graph validation has already proved every selector is unique.
 	for _, edge := range frozen.Edges {
 		plan.routes[edgeSelector{source: edge.From, outcome: edge.Outcome}] = edge.To
+	}
+	// Engine startup always selects the empty outcome, so a named-only start edge is not executable.
+	if _, exists := plan.routes[edgeSelector{source: plan.startID}]; !exists {
+		return nil, fmt.Errorf(
+			"%w: %w: definition %q node %q outcome %q",
+			ErrInvalidDefinition,
+			ErrRouteNotFound,
+			frozen.ID,
+			plan.startID,
+			"",
+		)
 	}
 	return plan, nil
 }
@@ -109,6 +134,7 @@ func (p *compiledDefinition) startNode() (*NodeDefinition, error) {
 // plan lifetime; missing IDs return ErrInvalidDefinition with Definition and node context.
 func (p *compiledDefinition) node(id string) (*NodeDefinition, error) {
 	index, exists := p.nodes[id]
+	// A miss indicates a corrupted runtime snapshot because compilation indexed every declared node.
 	if !exists {
 		return nil, fmt.Errorf("%w: definition %q node %q not found", ErrInvalidDefinition, p.definition.ID, id)
 	}
@@ -122,6 +148,7 @@ func (p *compiledDefinition) node(id string) (*NodeDefinition, error) {
 // is read-only and owned by the plan.
 func (p *compiledDefinition) nextNode(source, outcome string) (*NodeDefinition, error) {
 	target, exists := p.routes[edgeSelector{source: source, outcome: outcome}]
+	// Fail at the exact selector so handlers cannot fall through to slice-order-dependent routing.
 	if !exists {
 		return nil, fmt.Errorf(
 			"%w: definition %q node %q outcome %q",

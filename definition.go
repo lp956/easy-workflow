@@ -218,6 +218,7 @@ func (d *Definition) Validate() error {
 			return fmt.Errorf("%w: end node %q has an outgoing edge", ErrInvalidDefinition, edge.From)
 		}
 		selector := edgeSelector{source: edge.From, outcome: edge.Outcome}
+		// Duplicate selectors would make target choice depend on declaration order.
 		if _, exists := selectors[selector]; exists {
 			return fmt.Errorf(
 				"%w: %w: definition %q node %q outcome %q selects multiple targets",
