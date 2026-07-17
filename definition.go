@@ -170,50 +170,25 @@ func ParseDefinition(data []byte) (*Definition, error) {
 // Validation is read-only and safe to call concurrently when the Definition is not being mutated.
 // ErrInvalidDefinition is present in every returned domain-validation error.
 func (d *Definition) Validate() error {
-	if d == nil {
-		return fmt.Errorf("%w: definition is nil", ErrInvalidDefinition)
-	}
-	if d.ID == "" {
-		return fmt.Errorf("%w: id is empty", ErrInvalidDefinition)
-	}
-
-	// Index nodes once so uniqueness, cardinality, and edge checks share the same source of truth.
-	nodes := make(map[string]NodeDefinition, len(d.Nodes))
-	startCount := 0
-	startID := ""
-	endCount := 0
-	for _, node := range d.Nodes {
-		if node.ID == "" || node.Kind == "" {
-			return fmt.Errorf("%w: node id and kind must be non-empty", ErrInvalidDefinition)
-		}
-		if _, exists := nodes[node.ID]; exists {
-			return fmt.Errorf("%w: duplicate node %q", ErrInvalidDefinition, node.ID)
-		}
-		nodes[node.ID] = node
-		switch node.Kind {
-		case KindStart:
-			startCount++
-			startID = node.ID
-		case KindEnd:
-			endCount++
-		}
-	}
-	if startCount != 1 {
-		return fmt.Errorf("%w: expected one start node, got %d", ErrInvalidDefinition, startCount)
-	}
-	if endCount == 0 {
-		return fmt.Errorf("%w: expected at least one end node", ErrInvalidDefinition)
+	// Establish identity and cardinality invariants before any edge resolves against the node index.
+	nodes, startID, err := indexDefinitionNodes(d)
+	// Identity or cardinality failure makes every downstream edge and reachability result meaningless.
+	if err != nil {
+		return err
 	}
 
 	// Resolve every edge only after all nodes are indexed, allowing declarations in any order.
 	selectors := make(map[edgeSelector]struct{}, len(d.Edges))
 	for _, edge := range d.Edges {
+		// Every source must resolve before its kind can be checked safely.
 		if _, exists := nodes[edge.From]; !exists {
 			return fmt.Errorf("%w: edge source %q does not exist", ErrInvalidDefinition, edge.From)
 		}
+		// Every target must be part of the same canonical Definition snapshot.
 		if _, exists := nodes[edge.To]; !exists {
 			return fmt.Errorf("%w: edge target %q does not exist", ErrInvalidDefinition, edge.To)
 		}
+		// Terminal nodes cannot hide executable successors behind serialized edges.
 		if nodes[edge.From].Kind == KindEnd {
 			return fmt.Errorf("%w: end node %q has an outgoing edge", ErrInvalidDefinition, edge.From)
 		}
@@ -231,6 +206,7 @@ func (d *Definition) Validate() error {
 		}
 		selectors[selector] = struct{}{}
 	}
+	// Structural passes run only after every edge endpoint and selector is known to be deterministic.
 	if err := validateAcyclic(nodes, d.Edges); err != nil {
 		return err
 	}
@@ -241,6 +217,57 @@ func (d *Definition) Validate() error {
 		return err
 	}
 	return nil
+}
+
+// indexDefinitionNodes validates Definition identity and builds the unique node index used by graph checks.
+//
+// definition must be non-nil with a non-empty stable ID, exactly one start node, and at least one end node.
+// The returned map owns its index entries while NodeDefinition values continue to reference immutable Config
+// bytes from definition. startID is empty only when an error is returned; every error wraps ErrInvalidDefinition.
+func indexDefinitionNodes(definition *Definition) (map[string]NodeDefinition, string, error) {
+	// Reject incomplete identity before deriving allocation sizes or indexing caller-owned graph data.
+	if definition == nil {
+		return nil, "", fmt.Errorf("%w: definition is nil", ErrInvalidDefinition)
+	}
+	// An empty stable identity cannot own published versions or persisted instances.
+	if definition.ID == "" {
+		return nil, "", fmt.Errorf("%w: id is empty", ErrInvalidDefinition)
+	}
+
+	// Index each node once while counting the control-node cardinalities required by execution.
+	nodes := make(map[string]NodeDefinition, len(definition.Nodes))
+	startCount := 0
+	startID := ""
+	endCount := 0
+	for _, node := range definition.Nodes {
+		// Both fields participate in persistence and runtime lookup, so neither has a useful zero value.
+		if node.ID == "" || node.Kind == "" {
+			return nil, "", fmt.Errorf("%w: node id and kind must be non-empty", ErrInvalidDefinition)
+		}
+		// Duplicate IDs would make execution depend on declaration order.
+		if _, exists := nodes[node.ID]; exists {
+			return nil, "", fmt.Errorf("%w: duplicate node %q", ErrInvalidDefinition, node.ID)
+		}
+		nodes[node.ID] = node
+		switch node.Kind {
+		case KindStart:
+			startCount++
+			startID = node.ID
+		case KindEnd:
+			endCount++
+		}
+	}
+
+	// Cardinality errors must be reported after the full scan so declarations can appear in any order.
+	// Exactly one start keeps startup routing deterministic.
+	if startCount != 1 {
+		return nil, "", fmt.Errorf("%w: expected one start node, got %d", ErrInvalidDefinition, startCount)
+	}
+	// At least one end is required for every validated branch to terminate successfully.
+	if endCount == 0 {
+		return nil, "", fmt.Errorf("%w: expected at least one end node", ErrInvalidDefinition)
+	}
+	return nodes, startID, nil
 }
 
 // validateAcyclic uses Kahn's algorithm to reject any cycle without recursive stack growth.

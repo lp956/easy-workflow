@@ -12,6 +12,8 @@ import (
 )
 
 var (
+	// ErrInvalidStoreInput means an instance Store or required aggregate input is absent.
+	ErrInvalidStoreInput = errors.New("workflow: invalid store input")
 	// ErrInstanceNotFound means no workflow instance exists for the requested identifier.
 	ErrInstanceNotFound = errors.New("workflow: instance not found")
 	// ErrInstanceExists means Create received an identifier that is already durable.
@@ -47,20 +49,28 @@ func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{instances: make(map[InstanceID]*Instance)}
 }
 
-// Create inserts a new instance and rejects duplicate identifiers.
+// Create atomically inserts a detached instance snapshot and rejects duplicate identifiers.
+//
+// instance and its ID must be non-empty, and ctx must remain active until the in-memory commit completes.
+// The store retains no caller-owned slices. Errors wrap context cancellation, ErrInvalidStoreInput, or
+// ErrInstanceExists; a failed call leaves the process-local snapshot map unchanged.
 func (s *MemoryStore) Create(ctx context.Context, instance *Instance) error {
+	// Cancellation takes precedence because no caller can consume a successful write after abandoning it.
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("workflow: create instance: %w", err)
 	}
+	// A missing store, aggregate, or identity cannot form a durable ownership boundary.
 	if s == nil || instance == nil || instance.ID == "" {
-		return fmt.Errorf("workflow: create instance: invalid input")
+		return fmt.Errorf("%w: create requires store and instance identity", ErrInvalidStoreInput)
 	}
 
+	// Hold the exclusive lock across lazy initialization, duplicate detection, and insertion.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.instances == nil {
 		s.instances = make(map[InstanceID]*Instance)
 	}
+	// Insert-only semantics prevent a second creator from overwriting an existing execution snapshot.
 	if _, exists := s.instances[instance.ID]; exists {
 		return fmt.Errorf("%w: %q", ErrInstanceExists, instance.ID)
 	}
@@ -68,40 +78,55 @@ func (s *MemoryStore) Create(ctx context.Context, instance *Instance) error {
 	return nil
 }
 
-// Load returns a defensive snapshot for id or ErrInstanceNotFound.
+// Load returns a caller-owned snapshot for one exact instance ID.
+//
+// ctx must remain active through the read. The returned aggregate deep-copies every mutable field and may be
+// changed freely by its caller. Errors wrap context cancellation, ErrInvalidStoreInput, or ErrInstanceNotFound.
 func (s *MemoryStore) Load(ctx context.Context, id InstanceID) (*Instance, error) {
+	// Avoid lock acquisition when the caller can no longer consume the loaded aggregate.
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("workflow: load instance: %w", err)
 	}
+	// A nil adapter has no implicit global store fallback.
 	if s == nil {
-		return nil, fmt.Errorf("workflow: load instance: store is nil")
+		return nil, fmt.Errorf("%w: load requires a store", ErrInvalidStoreInput)
 	}
 
+	// Clone while holding the read lock so every field comes from one consistent stored pointer.
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	instance, exists := s.instances[id]
+	// Missing identity never falls back to another or newly created instance.
 	if !exists {
 		return nil, fmt.Errorf("%w: %q", ErrInstanceNotFound, id)
 	}
 	return cloneInstance(instance), nil
 }
 
-// Save replaces a snapshot only when expectedVersion matches the durable version.
+// Save atomically replaces a snapshot only when expectedVersion matches the durable version.
+//
+// instance must be non-nil and ctx must remain active through the compare-and-swap. The store retains a deep
+// copy rather than caller-owned slices. Errors wrap cancellation, ErrInvalidStoreInput, ErrInstanceNotFound,
+// or ErrVersionConflict; every failed path preserves the previously stored aggregate.
 func (s *MemoryStore) Save(ctx context.Context, instance *Instance, expectedVersion uint64) error {
+	// Cancellation prevents a write whose result the caller has already abandoned.
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("workflow: save instance: %w", err)
 	}
+	// CAS requires both a concrete adapter and an aggregate carrying the candidate identity and version.
 	if s == nil || instance == nil {
-		return fmt.Errorf("workflow: save instance: invalid input")
+		return fmt.Errorf("%w: save requires store and instance", ErrInvalidStoreInput)
 	}
 
 	// Hold one exclusive lock across comparison and replacement so CAS is atomic for concurrent commands.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	stored, exists := s.instances[instance.ID]
+	// Save never creates a missing aggregate because creation has a separate insert-only contract.
 	if !exists {
 		return fmt.Errorf("%w: %q", ErrInstanceNotFound, instance.ID)
 	}
+	// Reject stale callers at the comparison point so no field can be partially replaced.
 	if stored.Version != expectedVersion {
 		return fmt.Errorf("%w: expected %d, got %d", ErrVersionConflict, expectedVersion, stored.Version)
 	}

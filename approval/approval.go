@@ -25,6 +25,15 @@ const (
 	OutcomeRejected = "rejected"
 )
 
+var (
+	// ErrInvalidCommand means an approval command name is unsupported by the active handler.
+	ErrInvalidCommand = errors.New("approval: invalid command")
+	// ErrTaskNotActive means a command does not target an active task owned by its declared actor.
+	ErrTaskNotActive = errors.New("approval: task is not active for actor")
+	// ErrInvalidConfig means approval mode or assignee configuration cannot be activated safely.
+	ErrInvalidConfig = errors.New("approval: invalid config")
+)
+
 // Mode defines how affirmative decisions satisfy an approval node.
 type Mode string
 
@@ -84,13 +93,17 @@ func (h *Handler) Activate(ctx context.Context, input workflow.ActivationInput) 
 // The command actor must own the active task. Or-sign completes on the first decision; countersign waits
 // for every approval but rejects immediately. Returned tasks are detached from input.Tasks.
 func (h *Handler) Handle(ctx context.Context, input workflow.CommandInput) (workflow.NodeResult, error) {
+	// Cancellation prevents an abandoned actor command from proposing any state transition.
 	if err := ctx.Err(); err != nil {
 		return workflow.NodeResult{}, fmt.Errorf("approval: handle: %w", err)
 	}
+	// Re-validate frozen configuration because persisted instances may outlive the publishing process.
 	config, err := parseConfig(input.Config)
 	if err != nil {
 		return workflow.NodeResult{}, err
 	}
+
+	// Resolve the command task only within the defensive node-owned task snapshot supplied by Engine.
 	tasks := slices.Clone(input.Tasks)
 	taskIndex := -1
 	for i := range tasks {
@@ -99,8 +112,9 @@ func (h *Handler) Handle(ctx context.Context, input workflow.CommandInput) (work
 			break
 		}
 	}
+	// Identity, ownership, and active status must all hold before the actor can change the task set.
 	if taskIndex < 0 || tasks[taskIndex].Assignee != input.ActorID || tasks[taskIndex].Status != workflow.TaskStatusActive {
-		return workflow.NodeResult{}, errors.New("approval: task is not active for actor")
+		return workflow.NodeResult{}, ErrTaskNotActive
 	}
 
 	// Apply the actor's decision before calculating whether sibling tasks must remain active or close.
@@ -123,31 +137,40 @@ func (h *Handler) Handle(ctx context.Context, input workflow.CommandInput) (work
 		closeActiveTasks(tasks)
 		return workflow.NodeResult{Disposition: workflow.DispositionReject, Tasks: tasks}, nil
 	default:
-		return workflow.NodeResult{}, fmt.Errorf("approval: unsupported command %q", input.Name)
+		return workflow.NodeResult{}, fmt.Errorf("%w: unsupported command %q", ErrInvalidCommand, input.Name)
 	}
 }
 
-// parseConfig decodes and validates the complete approval configuration.
+// parseConfig decodes and validates the complete approval configuration used by publication and execution.
+//
+// data must contain one Config JSON value with ModeAny or ModeAll and a non-empty set of unique, non-empty
+// assignees. The returned Config owns its decoded assignee slice. Errors retain JSON syntax causes or wrap
+// ErrInvalidConfig; the function performs no I/O and is safe for concurrent calls.
 func parseConfig(data json.RawMessage) (Config, error) {
+	// Decode into fresh storage so handler calls never retain or mutate caller-owned JSON bytes.
 	var config Config
 	if err := json.Unmarshal(data, &config); err != nil {
 		return Config{}, fmt.Errorf("approval: parse config: %w", err)
 	}
+	// Only the two documented decision policies have complete runtime semantics.
 	if config.Mode != ModeAny && config.Mode != ModeAll {
-		return Config{}, fmt.Errorf("approval: unsupported mode %q", config.Mode)
+		return Config{}, fmt.Errorf("%w: unsupported mode %q", ErrInvalidConfig, config.Mode)
 	}
+	// At least one frozen actor is required or the approval could never receive a valid command.
 	if len(config.Assignees) == 0 {
-		return Config{}, errors.New("approval: assignees are empty")
+		return Config{}, fmt.Errorf("%w: assignees are empty", ErrInvalidConfig)
 	}
 
 	// Reject duplicate actors because one person must never contribute multiple decisions to a frozen round.
 	seen := make(map[workflow.ActorID]struct{}, len(config.Assignees))
 	for _, assignee := range config.Assignees {
+		// Empty actor identity cannot participate in task ownership checks.
 		if assignee == "" {
-			return Config{}, errors.New("approval: assignee is empty")
+			return Config{}, fmt.Errorf("%w: assignee is empty", ErrInvalidConfig)
 		}
+		// Duplicate actors would let one person contribute more than one countersign decision.
 		if _, exists := seen[assignee]; exists {
-			return Config{}, fmt.Errorf("approval: duplicate assignee %q", assignee)
+			return Config{}, fmt.Errorf("%w: duplicate assignee %q", ErrInvalidConfig, assignee)
 		}
 		seen[assignee] = struct{}{}
 	}

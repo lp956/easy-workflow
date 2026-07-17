@@ -8,11 +8,11 @@ run:
 # ============================================================
 # linters —— default: none，仅启用高价值检查器
 #   保留原则：抓真实 bug / 安全 / 规范，近零误报；
-#   风格噪音（revive / wsl_v5 / paralleltest / godot / dupword
-#   / goconst / thelper / gocritic 等）一律不启用。
+#   风格噪音（revive / wsl_v5 / paralleltest / godot / goconst 等）
+#   默认不启用；仅保留已在本仓库验证为零噪音的护栏。
 #   v2 合并档：在「可用档」基础上增量加入候选的高价值低噪音项
 #   （errchkjson / nilnil / unconvert / usestdlibvars / wastedassign
-#   / reassign / makezero / contextcheck / sloglint / nolintlint）。
+#   / reassign / makezero / contextcheck / nolintlint）。
 # ============================================================
 linters:
   default: none
@@ -25,7 +25,10 @@ linters:
     - errcheck         # 未检查的 error 返回值（类型断言已关，见 settings）
     - errorlint        # 要求 errors.Is/As 与 %w 包装（Go 1.13+ 规范）
     - nilerr           # err 非 nil 却返回 nil，抓真实逻辑 bug
+    - nilnesserr       # err 分支返回了另一个 nil error，补足 nilerr 的数据流检查
     - nilnil           # 同时返回 nil, nil（应 nil, err 或 err, nil）
+    - wrapcheck        # 外部包错误必须补充本层上下文
+    - err113           # 可复用静态错误使用包级 sentinel，动态错误使用 %w
     - forcetypeassert  # 无 comma-ok 的裸类型断言（可能 panic）
     - predeclared      # 遮蔽 Go 内建（len/cap/error 等）
     - asciicheck       # 非 ASCII 标识符（防 homoglyph / 木马源码）
@@ -37,6 +40,10 @@ linters:
     - reassign          # 包级变量被重新赋值
     - makezero          # 切片声明带非零初始长度
     - contextcheck      # context 未沿调用链传递
+    - containedctx      # 禁止把 Context 保存到长期存活的结构体字段
+    - asasalint         # 防止把 []any 作为单个 any 误传给可变参数
+    - iotamixing        # 禁止同一 const 块混合 iota 与普通声明
+    - nosprintfhostport # 禁止用 Sprintf 手工拼接 host:port
     - nolintlint        # //nolint 规范性：必须指定具体 linter + 说明理由（见 settings）
     - errname           # 错误变量命名须 err / Err 前缀（一致性）
     - gocheckcompilerdirectives # //go:build / //go:linkname 等编译器指令语法校验
@@ -44,9 +51,16 @@ linters:
     - gomoddirectives    # 禁止 go.mod 随意 replace/exclude（依赖治理）
     - canonicalheader    # HTTP 头键名须规范（Content-Type 而非 content-type）
     - musttag           # 参与序列化的结构体须带 json/yaml/xml/toml/mapstructure tag
+    - recvcheck         # 同一类型的方法 receiver 形式必须一致
+    - unparam           # 私有实现参数必须被实际使用
+
+    # ---------- API 契约 ----------
+    - iface             # 避免无收益的单实现接口与接口污染
+    - inamedparam       # interface 方法参数必须命名，保持公开契约可读
+    - interfacebloat    # 限制大接口，保持调用方 seam 聚焦
 
     # ---------- 复杂度 ----------
-    - gocyclo          # 圈复杂度，阈值已调高到 20（见 settings）
+    - gocyclo          # 圈复杂度上限 15（见 settings）
     - nestif           # 深层嵌套 if/else，阈值已放宽到 8（见 settings）
     - funlen           # 函数过长，测试已豁免（见 exclude-rules）
 
@@ -62,12 +76,21 @@ linters:
     - bidichk          # 双向 Unicode 控制字符（CVE-2021-42574）
 
     # ---------- 治理 / 护栏 ----------
-    - forbidigo        # 禁 panic / fmt.Println 等生产代码禁止项；cmd/apitest 与测试已豁免（见 exclusions）
+    - forbidigo        # 禁 panic / fmt.Println 等生产代码禁止项；测试代码已豁免
     - godox            # TODO/FIXME/BUG/XXX 显式标注技术债，防止无声堆积
-    - gochecknoinits   # 禁 func init()；docs/（swag 自动生成）已豁免（见 exclusions）
+    - gochecknoinits   # 禁 func init()，核心库不得依赖隐式初始化副作用
+    - gochecknoglobals # 禁止可变包级状态；标准错误 sentinel 等安全声明仍允许
 
     # ---------- 风格护栏 ----------
     - lll              # 行宽上限 140（见 settings），测试已豁免
+    - embeddedstructfieldcheck # 嵌入字段置顶，避免字段布局难以扫描
+    - misspell         # 英文拼写错误
+    - dupword          # 注释与字符串中的重复单词
+
+    # ---------- 测试契约 ----------
+    - testableexamples # 示例必须包含可执行的 Output 断言
+    - testpackage      # 测试通过外部 package seam 验证公开 API
+    - thelper          # 测试 helper 必须调用 t.Helper()
 
     # ---------- 现代化 / 元 ----------
     - modernize        # 可换成新版 Go 特性的旧写法
@@ -77,10 +100,7 @@ linters:
 
     # ---------- 诊断 / 代码质量（gocritic 精选子集） ----------
     - gocritic         # 仅启用 diagnostic+performance 子集（见 settings.gocritic），排除签名变更/纯风格类
-
-    # ---------- 日志 ----------
-    - sloglint         # log/slog 使用一致性（项目已在 14 个文件使用 slog）
-    # - unparam
+    - perfsprint        # 固定错误文本使用 errors.New，避免无意义格式化
 
   # ============================================================
   # settings —— 各检查器参数（含中文说明）
@@ -99,19 +119,11 @@ linters:
       lines: 120       # 函数超 120 行报错（测试豁免）
       statements: 80    # 函数超 80 语句报错
     gocyclo:
-      min-complexity: 20   # 13 → 20，业务方法常超 13
+      min-complexity: 15   # 核心库保持低复杂度；当前最高业务方法复杂度为 13
     nestif:
-      min-complexity: 8     # 5 → 8，降低对合理 early-return 的干扰
+      min-complexity: 6     # 允许合理 early-return，同时阻止继续加深业务分支
     exhaustive:
       default-signifies-exhaustive: false   # 即便有 default 也要求显式枚举所有 case
-    sloglint:
-      no-mixed-args: true      # 禁止混合传参方式
-      kv-only: false           # 不强制仅键值对
-      attr-only: false         # 不强制仅 attr
-      no-global: ""            # 不强制禁用全局 logger
-      context: ""              # 不强制要求 context 参数
-      static-msg: false        # 不强制静态消息
-      key-naming-case: snake   # 键名命名风格 snake_case
     nolintlint:
       require-explanation: true   # //nolint 必须写原因
       require-specific: true      # //nolint 必须指定具体 linter，禁止 //nolint:lint
@@ -132,7 +144,7 @@ linters:
         - stringXbytes
         - unnecessaryBlock
     lll:
-      line-length: 160
+      line-length: 140
       tab-width: 4
     forbidigo:
       forbid:
@@ -146,8 +158,7 @@ linters:
   # 路径豁免
   #   - 测试文件：仅豁免复杂度/风格类，保留 errcheck/gosec/staticcheck
   #     抓真实问题（测试里的 bug 同样是 bug）
-  #   - cmd/ ：生产入口 cmd/server 必须接受 errcheck/gosec/staticcheck；
-  #     仅对启动期 net/http 无 context 的 noctx 豁免（bootstrap 不可回避）
+  # 当前仓库没有 cmd/、docs/ 或生成代码目录，因此不保留空路径豁免。
   # ============================================================  
   exclusions:
     presets:
@@ -167,15 +178,6 @@ linters:
           - noctx
           - forbidigo
           - lll
-      - path: cmd/
-        linters:
-          - noctx
-      - path: cmd/apitest/
-        linters:
-          - forbidigo
-      - path: docs/
-        linters:
-          - gochecknoinits
 
 # ============================================================
 # formatters —— gofmt + goimports + gci（真实 module 路径）
@@ -193,12 +195,12 @@ formatters:
       simplify: true
     goimports:
       local-prefixes:
-        - github.com/ipmp/ipmp
+        - github.com/lvpeng/easy-workflow
     gci:
       sections:
         - standard
         - default
-        - prefix(github.com/ipmp/ipmp)
+        - prefix(github.com/lvpeng/easy-workflow)
   exclusions:
     generated: strict
     warn-unused: true          # 导入分组豁免若匹配不到文件则告警

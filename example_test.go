@@ -4,18 +4,21 @@ package workflow_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	workflow "github.com/lvpeng/easy-workflow"
 	"github.com/lvpeng/easy-workflow/approval"
 )
 
-// Example demonstrates a complete or-sign leave request from definition to approval.
+// Example demonstrates Builder and JSON publication followed by an exact-version approval run.
 func Example() {
 	registry := workflow.NewRegistry()
 	if err := registry.Register(approval.Kind, approval.NewHandler()); err != nil {
 		panic(err)
 	}
+	definitions := workflow.NewMemoryDefinitionStore()
+	publisher := workflow.NewDefinitionPublisher(definitions, registry)
 	engine := workflow.NewEngine(workflow.NewMemoryStore(), registry)
 
 	// Code-authored and web-authored definitions converge on this same serializable graph model.
@@ -32,8 +35,22 @@ func Example() {
 	if err != nil {
 		panic(err)
 	}
+	published, err := publisher.Publish(context.Background(), definition)
+	if err != nil {
+		panic(err)
+	}
 
-	instance, err := engine.Start(context.Background(), definition, workflow.StartRequest{
+	// Web-authored JSON enters the same canonical compiler and receives the next immutable version.
+	data, err := json.Marshal(published)
+	if err != nil {
+		panic(err)
+	}
+	if _, err := publisher.PublishJSON(context.Background(), data); err != nil {
+		panic(err)
+	}
+
+	// Startup selects version 2 explicitly; the instance freezes that full published Definition snapshot.
+	instance, err := engine.StartPublished(context.Background(), definitions, "leave-request", 2, workflow.StartRequest{
 		ID:        "leave-1",
 		Initiator: "employee-a",
 	})

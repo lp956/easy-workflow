@@ -13,6 +13,10 @@ import (
 )
 
 var (
+	// ErrInvalidEngine means an operation cannot run because required Engine collaborators are absent.
+	ErrInvalidEngine = errors.New("workflow: invalid engine")
+	// ErrInvalidStartRequest means instance identity, initiator, business data, or published identity is invalid.
+	ErrInvalidStartRequest = errors.New("workflow: invalid start request")
 	// ErrInvalidCommand means a command violates the active instance, task, or handler contract.
 	ErrInvalidCommand = errors.New("workflow: invalid command")
 	// ErrInvalidNodeResult means a handler returned state the engine cannot safely persist.
@@ -41,12 +45,15 @@ func NewEngine(store Store, registry *Registry) *Engine {
 // request.ID and Initiator must be non-empty; Data must be absent or valid JSON. Handler activation runs
 // before persistence and may observe context cancellation. The returned snapshot is detached from Store.
 func (e *Engine) Start(ctx context.Context, definition *Definition, request StartRequest) (*Instance, error) {
+	// Required collaborators must exist before validation can resolve handlers or persist the new aggregate.
 	if e == nil || e.store == nil || e.registry == nil {
-		return nil, fmt.Errorf("workflow: start: engine dependencies are nil")
+		return nil, fmt.Errorf("%w: start dependencies are nil", ErrInvalidEngine)
 	}
+	// External identity and JSON syntax are checked before potentially expensive Definition compilation.
 	if request.ID == "" || request.Initiator == "" || !validJSON(request.Data) {
-		return nil, fmt.Errorf("workflow: start: id, initiator, or data is invalid")
+		return nil, fmt.Errorf("%w: id, initiator, or data is invalid", ErrInvalidStartRequest)
 	}
+	// Compilation freezes a trusted execution plan before any instance state becomes durable.
 	plan, err := compileDefinition(definition, e.registry)
 	if err != nil {
 		return nil, err
@@ -78,19 +85,40 @@ func (e *Engine) Start(ctx context.Context, definition *Definition, request Star
 	return cloneInstance(instance), nil
 }
 
+// StartPublished resolves one exact immutable Definition version and starts an instance from its snapshot.
+//
+// definitions must be a non-nil reader; definitionID must be non-empty and version must be positive. The
+// reader's not-found and context errors remain in the returned error chain. Startup then follows Start's
+// validation, handler, persistence, and ownership contract. No latest-version fallback is attempted.
+func (e *Engine) StartPublished(
+	ctx context.Context,
+	definitions DefinitionReader,
+	definitionID string,
+	version uint64,
+	request StartRequest,
+) (*Instance, error) {
+	// Exact-version startup requires a complete repository identity and never infers missing values.
+	if definitions == nil || definitionID == "" || version == 0 {
+		return nil, fmt.Errorf("%w: definition reader or identity is invalid", ErrInvalidStartRequest)
+	}
+
+	// Resolve through the immutable repository seam before Start freezes another copy into Instance storage.
+	definition, err := definitions.Load(ctx, definitionID, version)
+	// Preserve repository sentinels such as ErrDefinitionNotFound for caller error dispatch.
+	if err != nil {
+		return nil, fmt.Errorf("workflow: start published definition %q version %d: %w", definitionID, version, err)
+	}
+	return e.Start(ctx, definition, request)
+}
+
 // Handle processes one actor command against the current node and commits it with optimistic concurrency.
 //
 // The task must belong to the current node and actor. Handler errors leave durable state unchanged. A stale
 // concurrent command returns ErrVersionConflict from Store; callers may reload before deciding whether to retry.
 func (e *Engine) Handle(ctx context.Context, command Command) (*Instance, error) {
-	if e == nil || e.store == nil || e.registry == nil {
-		return nil, fmt.Errorf("workflow: handle: engine dependencies are nil")
-	}
-	if command.InstanceID == "" || command.TaskID == "" || command.ActorID == "" || command.Name == "" {
-		return nil, fmt.Errorf("%w: required command field is empty", ErrInvalidCommand)
-	}
-	if !validJSON(command.Payload) {
-		return nil, fmt.Errorf("%w: payload is not valid json", ErrInvalidCommand)
+	// Reject dependency and boundary-input errors before loading or mutating durable instance state.
+	if err := e.validateCommand(command); err != nil {
+		return nil, err
 	}
 
 	// Load one caller-owned aggregate and preserve its version for the final compare-and-swap.
@@ -141,6 +169,26 @@ func (e *Engine) Handle(ctx context.Context, command Command) (*Instance, error)
 		return nil, fmt.Errorf("workflow: persist command: %w", err)
 	}
 	return cloneInstance(instance), nil
+}
+
+// validateCommand checks Engine dependencies and the complete external command boundary before Store access.
+//
+// command identity fields must be non-empty and Payload must be absent or valid JSON. The method performs no
+// I/O and returns ErrInvalidEngine or ErrInvalidCommand so callers can classify setup and request failures.
+func (e *Engine) validateCommand(command Command) error {
+	// Missing collaborators make every command unsafe regardless of its input fields.
+	if e == nil || e.store == nil || e.registry == nil {
+		return fmt.Errorf("%w: handle dependencies are nil", ErrInvalidEngine)
+	}
+	// All four identities jointly bind the command to one task, actor, and handler operation.
+	if command.InstanceID == "" || command.TaskID == "" || command.ActorID == "" || command.Name == "" {
+		return fmt.Errorf("%w: required command field is empty", ErrInvalidCommand)
+	}
+	// Invalid JSON cannot be delegated because handlers own schema validation only after syntax is trustworthy.
+	if !validJSON(command.Payload) {
+		return fmt.Errorf("%w: payload is not valid json", ErrInvalidCommand)
+	}
+	return nil
 }
 
 // advance follows compiled routes and activates nodes until execution waits or reaches a terminal state.
