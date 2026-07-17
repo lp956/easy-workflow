@@ -1,5 +1,5 @@
-// This file implements the PostgreSQL workflow Store adapter over an explicitly supplied connection pool.
-// It owns persistence transactions but not pool configuration, connectivity, migrations, or query projections.
+// This file implements PostgreSQL command persistence over an explicitly supplied connection pool.
+// It owns aggregate transactions and atomic read-model refreshes, but not pool configuration, migrations, or queries.
 package postgres
 
 import (
@@ -61,8 +61,8 @@ func New(pool *pgxpool.Pool) *Store {
 // Create atomically inserts one detached workflow aggregate snapshot.
 //
 // instance and its ID must be non-empty, and ctx must remain active through commit. Definition, business data,
-// node state, tasks, and audit are committed in one transaction. Duplicate IDs wrap workflow.ErrInstanceExists;
-// every other database or encoding error retains its cause and leaves no partial rows.
+// node state, tasks, audit, and derived query rows are committed in one transaction. Duplicate IDs wrap
+// workflow.ErrInstanceExists; every other database or encoding error retains its cause and leaves no partial rows.
 func (s *Store) Create(ctx context.Context, instance *workflow.Instance) error {
 	// Cancellation takes precedence because an abandoned caller cannot consume a successful commit.
 	if err := ctx.Err(); err != nil {
@@ -77,7 +77,7 @@ func (s *Store) Create(ctx context.Context, instance *workflow.Instance) error {
 		return fmt.Errorf("postgres: encode instance %q: %w", instance.ID, err)
 	}
 
-	// Parent and child rows share one transaction so no externally visible partial aggregate can remain.
+	// Aggregate facts and their derived query rows share one transaction so no externally visible partial state remains.
 	err = withTransaction(ctx, s.pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
 		if _, execErr := tx.Exec(ctx, insertInstanceSQL, snapshot.parentArguments()...); execErr != nil {
 			if isDuplicateInstanceError(execErr) {
@@ -90,6 +90,9 @@ func (s *Store) Create(ctx context.Context, instance *workflow.Instance) error {
 		}
 		if copyErr := copyAudit(ctx, tx, instance.ID, snapshot.audit, 0); copyErr != nil {
 			return copyErr
+		}
+		if projectionErr := replaceQueryProjection(ctx, tx, instance); projectionErr != nil {
+			return projectionErr
 		}
 		return nil
 	})
@@ -133,9 +136,9 @@ func (s *Store) Load(ctx context.Context, id workflow.InstanceID) (*workflow.Ins
 // Save atomically replaces one aggregate only when its durable version equals expectedVersion.
 //
 // instance must be non-nil and ctx must remain active through commit. The parent conditional update is the CAS
-// authority across processes; task replacement and audit suffix insertion then occur in that same transaction. A missing ID wraps
-// workflow.ErrInstanceNotFound, a stale expectedVersion wraps workflow.ErrVersionConflict, and every failure
-// preserves the previously committed full aggregate.
+// authority across processes; task replacement, audit suffix insertion, and projection refresh occur in that same
+// transaction. A missing ID wraps workflow.ErrInstanceNotFound, a stale expectedVersion wraps
+// workflow.ErrVersionConflict, and every failure preserves the previously committed aggregate and query rows.
 func (s *Store) Save(ctx context.Context, instance *workflow.Instance, expectedVersion uint64) error {
 	// Cancellation before encoding or pool acquisition must leave the durable version unchanged.
 	if err := ctx.Err(); err != nil {
@@ -150,7 +153,7 @@ func (s *Store) Save(ctx context.Context, instance *workflow.Instance, expectedV
 		return fmt.Errorf("postgres: encode instance %q: %w", instance.ID, err)
 	}
 
-	// The conditional parent update runs before child replacement and rolls back with every later failure.
+	// The conditional parent update precedes fact and projection replacement and rolls back with every later failure.
 	err = withTransaction(ctx, s.pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
 		tag, execErr := tx.Exec(ctx, updateInstanceSQL, snapshot.updateArguments(expectedVersion)...)
 		if execErr != nil {
@@ -165,6 +168,9 @@ func (s *Store) Save(ctx context.Context, instance *workflow.Instance, expectedV
 		}
 		if replaceErr := replaceCollections(ctx, tx, instance.ID, snapshot, auditOffset); replaceErr != nil {
 			return replaceErr
+		}
+		if projectionErr := replaceQueryProjection(ctx, tx, instance); projectionErr != nil {
+			return projectionErr
 		}
 		return nil
 	})

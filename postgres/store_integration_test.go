@@ -12,6 +12,7 @@ import (
 	"os"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -290,16 +291,27 @@ func newIsolatedStore(t *testing.T, dsn string) workflow.Store {
 	return postgres.New(pool)
 }
 
-// applyInitialMigration explicitly executes the first versioned schema artifact for an isolated test schema.
+// applyInitialMigration executes all embedded up migrations as one setup operation for an isolated test schema.
 func applyInitialMigration(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 
-	data, err := fs.ReadFile(postgres.Migrations(), "migrations/0001_init.up.sql")
+	// Embedded paths sort lexically by version, matching the host-visible migration order used in production.
+	paths, err := fs.Glob(postgres.Migrations(), "migrations/*.up.sql")
 	if err != nil {
-		t.Fatalf("ReadFile() error = %v", err)
+		t.Fatalf("Glob() error = %v", err)
 	}
-	if _, err := pool.Exec(t.Context(), string(data)); err != nil {
-		t.Fatalf("initial migration error = %v", err)
+	var migrationSQL strings.Builder
+	for _, path := range paths {
+		data, readErr := fs.ReadFile(postgres.Migrations(), path)
+		if readErr != nil {
+			t.Fatalf("ReadFile(%q) error = %v", path, readErr)
+		}
+		migrationSQL.Write(data)
+		migrationSQL.WriteString("\n")
+	}
+	// One setup call avoids per-migration database I/O while preserving SQL statement order in the combined text.
+	if _, err := pool.Exec(t.Context(), migrationSQL.String()); err != nil {
+		t.Fatalf("migration error = %v", err)
 	}
 }
 
