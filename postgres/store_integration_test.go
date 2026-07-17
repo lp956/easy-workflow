@@ -330,6 +330,15 @@ func integrationInstance(id workflow.InstanceID, version uint64) *workflow.Insta
 		},
 		Audit: []workflow.AuditRecord{
 			{Action: "started", NodeID: "start", ActorID: "initiator-1", At: time.Date(2026, 1, 2, 3, 4, 5, 678901234, time.UTC)},
+			{
+				Action:       "instance.returned",
+				NodeID:       "review",
+				TargetNodeID: "approval",
+				ActorID:      "operator-1",
+				Reason:       "durable return audit",
+				NodeState:    `{"round":1}`,
+				At:           time.Date(2026, 1, 2, 4, 5, 6, 789012345, time.UTC),
+			},
 		},
 		Version: version,
 	}

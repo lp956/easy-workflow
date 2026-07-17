@@ -61,14 +61,21 @@ type Task struct {
 
 // AuditRecord is an immutable description of one accepted state transition.
 //
-// Action is a stable machine-readable name. ActorID is empty for engine-driven transitions. At is UTC;
-// sequence order is the slice order within Instance and remains authoritative if timestamps are equal.
+// Action is a stable machine-readable name. ActorID is empty for engine-driven transitions. NodeState optionally
+// preserves opaque source-node state on lifecycle history records. At is UTC; sequence order is the slice order
+// within Instance and remains authoritative if timestamps are equal.
 type AuditRecord struct {
-	Action  string    `json:"action"`
-	NodeID  string    `json:"nodeId,omitempty"`
-	TaskID  TaskID    `json:"taskId,omitempty"`
-	ActorID ActorID   `json:"actorId,omitempty"`
-	At      time.Time `json:"at"`
+	Action string `json:"action"`
+	NodeID string `json:"nodeId,omitempty"`
+	// TargetNodeID identifies the explicit destination of a lifecycle transition when one exists.
+	TargetNodeID string  `json:"targetNodeId,omitempty"`
+	TaskID       TaskID  `json:"taskId,omitempty"`
+	ActorID      ActorID `json:"actorId,omitempty"`
+	// Reason preserves the host-provided lifecycle justification verbatim.
+	Reason string `json:"reason,omitempty"`
+	// NodeState preserves opaque source-node bytes as a string before a lifecycle transition replaces current state.
+	NodeState string    `json:"nodeState,omitempty"`
+	At        time.Time `json:"at"`
 }
 
 // Instance is a durable snapshot of workflow execution, active assignments, and audit history.
@@ -118,6 +125,31 @@ type WithdrawRequest struct {
 type WithdrawalPolicy interface {
 	// AuthorizeWithdrawal returns nil only when actor may withdraw the supplied pre-transition snapshot.
 	AuthorizeWithdrawal(ctx context.Context, actor ActorID, instance *Instance) error
+}
+
+// ReturnRequest identifies one running instance, trusted actor, explicit historical target, and audit reason.
+//
+// TargetNodeID is never inferred from Definition order. ActorID must come from host-established identity, while
+// Reason is persisted verbatim for audit. Engine validates graph membership and execution history before policy.
+type ReturnRequest struct {
+	// InstanceID identifies the aggregate to return and must be non-empty.
+	InstanceID InstanceID `json:"instanceId"`
+	// ActorID identifies the authenticated host principal requesting return and must be non-empty.
+	ActorID ActorID `json:"actorId"`
+	// TargetNodeID identifies one previously entered non-control node and must be non-empty.
+	TargetNodeID string `json:"targetNodeId"`
+	// Reason explains the return for audit and must contain at least one non-whitespace character.
+	Reason string `json:"reason"`
+}
+
+// ReturnPolicy authorizes an explicit return after Engine validates its graph and history constraints.
+//
+// Engine supplies a defensive pre-transition snapshot and the validated request. Implementations may apply
+// host-owned identity, tenant, and source-target rules; a non-nil error denies return. Implementations must honor
+// context cancellation for blocking work and be safe for the host's Engine concurrency model.
+type ReturnPolicy interface {
+	// AuthorizeReturn returns nil only when the actor may perform this exact source-target return.
+	AuthorizeReturn(ctx context.Context, request ReturnRequest, instance *Instance) error
 }
 
 // Command asks the handler for the current node to process one task action.

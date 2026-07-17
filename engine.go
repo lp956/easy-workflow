@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -23,6 +24,10 @@ var (
 	ErrInvalidWithdrawRequest = errors.New("workflow: invalid withdraw request")
 	// ErrInstanceNotRunning means a lifecycle operation targeted an already terminal instance.
 	ErrInstanceNotRunning = errors.New("workflow: instance is not running")
+	// ErrInvalidReturnRequest means return lacks identity, an explicit target, a reason, or host policy.
+	ErrInvalidReturnRequest = errors.New("workflow: invalid return request")
+	// ErrInvalidReturnTarget means return selected a control, current, absent, unvisited, or non-task node.
+	ErrInvalidReturnTarget = errors.New("workflow: invalid return target")
 	// ErrInvalidNodeResult means a handler returned state the engine cannot safely persist.
 	ErrInvalidNodeResult = errors.New("workflow: invalid node result")
 )
@@ -34,6 +39,26 @@ var (
 type Engine struct {
 	store    Store
 	registry *Registry
+}
+
+// instanceCommand defines the invariant execution phases shared by task and lifecycle commands.
+//
+// prepare validates operation-specific state and authorization against a defensive snapshot. audit builds the
+// causal record appended before transition mutates the loaded aggregate. executeInstanceCommand owns loading,
+// running-state enforcement, version advancement, CAS persistence, and detached result ownership.
+type instanceCommand struct {
+	// name identifies the operation in load and persistence error context.
+	name string
+	// instanceID selects the aggregate loaded exactly once for this command attempt.
+	instanceID InstanceID
+	// nonRunningError classifies terminal-state rejection for the public operation.
+	nonRunningError error
+	// prepare validates and authorizes against a detached pre-transition snapshot.
+	prepare func(*Instance) error
+	// audit constructs the immutable causal record from the loaded pre-transition aggregate.
+	audit func(*Instance) AuditRecord
+	// transition applies operation-specific aggregate changes after audit append.
+	transition func(*Instance) error
 }
 
 // NewEngine constructs an engine with explicit persistence and handler dependencies.
@@ -125,54 +150,52 @@ func (e *Engine) Handle(ctx context.Context, command Command) (*Instance, error)
 		return nil, err
 	}
 
-	// Load one caller-owned aggregate and preserve its version for the final compare-and-swap.
-	instance, err := e.store.Load(ctx, command.InstanceID)
-	if err != nil {
-		return nil, fmt.Errorf("workflow: handle command: %w", err)
-	}
-	if instance.Status != InstanceStatusRunning {
-		return nil, fmt.Errorf("%w: instance is %q", ErrInvalidCommand, instance.Status)
-	}
-	plan, err := compileDefinition(&instance.Definition, e.registry)
-	if err != nil {
-		return nil, err
-	}
-	expectedVersion := instance.Version
-	node, err := plan.node(instance.CurrentNodeID)
-	if err != nil {
-		return nil, err
-	}
-	handler, err := e.registry.handler(node.Kind)
-	if err != nil {
-		return nil, err
-	}
-
-	// Limit handler visibility to its current node, preventing accidental mutation of historical assignments.
-	result, err := handler.Handle(ctx, CommandInput{
-		Config:  slices.Clone(node.Config),
-		Data:    slices.Clone(instance.Data),
-		State:   slices.Clone(instance.NodeState),
-		Tasks:   tasksForNode(instance.Tasks, node.ID),
-		Command: command,
+	// Prepare handler output from a detached snapshot, then let the shared command skeleton commit it once.
+	var plan *compiledDefinition
+	var node *NodeDefinition
+	var result NodeResult
+	return e.executeInstanceCommand(ctx, instanceCommand{
+		name:            "task command",
+		instanceID:      command.InstanceID,
+		nonRunningError: ErrInvalidCommand,
+		prepare: func(snapshot *Instance) error {
+			var err error
+			plan, err = compileDefinition(&snapshot.Definition, e.registry)
+			if err != nil {
+				return err
+			}
+			node, err = plan.node(snapshot.CurrentNodeID)
+			if err != nil {
+				return err
+			}
+			handler, err := e.registry.handler(node.Kind)
+			if err != nil {
+				return err
+			}
+			result, err = handler.Handle(ctx, CommandInput{
+				Config:  slices.Clone(node.Config),
+				Data:    slices.Clone(snapshot.Data),
+				State:   slices.Clone(snapshot.NodeState),
+				Tasks:   tasksForNode(snapshot.Tasks, node.ID),
+				Command: command,
+			})
+			if err != nil {
+				return fmt.Errorf("workflow: handle node %q command: %w", node.ID, err)
+			}
+			return nil
+		},
+		audit: func(*Instance) AuditRecord {
+			return AuditRecord{
+				Action:  "task." + command.Name,
+				NodeID:  node.ID,
+				TaskID:  command.TaskID,
+				ActorID: command.ActorID,
+			}
+		},
+		transition: func(instance *Instance) error {
+			return e.applyResult(ctx, instance, plan, node, result)
+		},
 	})
-	if err != nil {
-		return nil, fmt.Errorf("workflow: handle node %q command: %w", node.ID, err)
-	}
-	// Record the causal command before its resulting node transitions so audit order mirrors execution order.
-	e.appendAudit(instance, AuditRecord{
-		Action:  "task." + command.Name,
-		NodeID:  node.ID,
-		TaskID:  command.TaskID,
-		ActorID: command.ActorID,
-	})
-	if err := e.applyResult(ctx, instance, plan, node, result); err != nil {
-		return nil, err
-	}
-	instance.Version++
-	if err := e.store.Save(ctx, instance, expectedVersion); err != nil {
-		return nil, fmt.Errorf("workflow: persist command: %w", err)
-	}
-	return cloneInstance(instance), nil
 }
 
 // Withdraw authorizes and atomically ends one running instance without executing its active node handler.
@@ -195,40 +218,217 @@ func (e *Engine) Withdraw(
 		return nil, fmt.Errorf("%w: instance, actor, or policy is empty", ErrInvalidWithdrawRequest)
 	}
 
-	// Load one caller-owned aggregate and reject terminal states before invoking host authorization logic.
-	instance, err := e.store.Load(ctx, request.InstanceID)
+	// Supply only withdrawal-specific policy, audit, and mutation to the shared command execution skeleton.
+	return e.executeInstanceCommand(ctx, instanceCommand{
+		name:            "withdrawal",
+		instanceID:      request.InstanceID,
+		nonRunningError: ErrInstanceNotRunning,
+		prepare: func(snapshot *Instance) error {
+			if err := policy.AuthorizeWithdrawal(ctx, request.ActorID, snapshot); err != nil {
+				return fmt.Errorf("workflow: authorize withdrawal: %w", err)
+			}
+			return nil
+		},
+		audit: func(instance *Instance) AuditRecord {
+			return AuditRecord{
+				Action:  "instance.withdrawn",
+				NodeID:  instance.CurrentNodeID,
+				ActorID: request.ActorID,
+			}
+		},
+		transition: func(instance *Instance) error {
+			instance.Status = InstanceStatusWithdrawn
+			for index := range instance.Tasks {
+				if instance.Tasks[index].Status == TaskStatusActive {
+					instance.Tasks[index].Status = TaskStatusClosed
+				}
+			}
+			return nil
+		},
+	})
+}
+
+// Return authorizes and atomically moves one running instance to an explicit previously entered task node.
+//
+// request identities, target, non-blank reason, and policy are required. Engine validates the frozen Definition,
+// rejects start, end, current, absent, and unvisited targets, then asks host policy to authorize a defensive
+// pre-transition snapshot. Success closes active tasks at the source, preserves historical tasks and audit,
+// activates a fresh waiting task round at the target, increments Version once, and commits through Store.Save
+// CAS. Every error leaves durable state unchanged; returned snapshots are detached from Store ownership.
+func (e *Engine) Return(
+	ctx context.Context,
+	request ReturnRequest,
+	policy ReturnPolicy,
+) (*Instance, error) {
+	// Return needs the registry to validate and activate the explicit target through its registered handler.
+	if e == nil || e.store == nil || e.registry == nil {
+		return nil, fmt.Errorf("%w: return dependencies are nil", ErrInvalidEngine)
+	}
+	if request.InstanceID == "" || request.ActorID == "" || request.TargetNodeID == "" ||
+		strings.TrimSpace(request.Reason) == "" || policy == nil {
+		return nil, fmt.Errorf("%w: instance, actor, target, reason, or policy is empty", ErrInvalidReturnRequest)
+	}
+
+	// Prepare the exact historical target and task drafts before the shared skeleton mutates the loaded aggregate.
+	var target *NodeDefinition
+	var result NodeResult
+	return e.executeInstanceCommand(ctx, instanceCommand{
+		name:            "return",
+		instanceID:      request.InstanceID,
+		nonRunningError: ErrInstanceNotRunning,
+		prepare: func(snapshot *Instance) error {
+			var err error
+			target, result, err = e.prepareReturn(ctx, request, policy, snapshot)
+			return err
+		},
+		audit: func(instance *Instance) AuditRecord {
+			return AuditRecord{
+				Action:       "instance.returned",
+				NodeID:       instance.CurrentNodeID,
+				TargetNodeID: target.ID,
+				ActorID:      request.ActorID,
+				Reason:       request.Reason,
+				NodeState:    string(instance.NodeState),
+			}
+		},
+		transition: func(instance *Instance) error {
+			return e.applyReturnTransition(instance, target, result)
+		},
+	})
+}
+
+// prepareReturn validates one historical target, authorizes it, and activates detached task drafts.
+//
+// request has passed boundary validation and snapshot is a detached running aggregate. The method compiles only
+// snapshot.Definition, rejects control, current, absent, and unvisited targets, then invokes policy with another
+// defensive snapshot so policy mutation cannot affect activation. Success returns the compiled target and a
+// waiting non-empty task result; errors leave the command candidate untouched and preserve stable sentinels.
+func (e *Engine) prepareReturn(
+	ctx context.Context,
+	request ReturnRequest,
+	policy ReturnPolicy,
+	snapshot *Instance,
+) (*NodeDefinition, NodeResult, error) {
+	// Resolve the exact requested ID from the frozen plan rather than Definition slice position.
+	plan, err := compileDefinition(&snapshot.Definition, e.registry)
 	if err != nil {
-		return nil, fmt.Errorf("workflow: withdraw instance: %w", err)
+		return nil, NodeResult{}, err
 	}
-	if instance.Status != InstanceStatusRunning {
-		return nil, fmt.Errorf("%w: instance %q is %q", ErrInstanceNotRunning, instance.ID, instance.Status)
+	target, err := plan.node(request.TargetNodeID)
+	if err != nil {
+		return nil, NodeResult{}, fmt.Errorf("%w: %w", ErrInvalidReturnTarget, err)
 	}
-	expectedVersion := instance.Version
+	// Control, current, and unvisited nodes cannot represent an earlier executable task round.
+	if target.Kind == KindStart || target.Kind == KindEnd || target.ID == snapshot.CurrentNodeID ||
+		!hasEnteredNode(snapshot.Audit, target.ID) {
+		return nil, NodeResult{}, fmt.Errorf(
+			"%w: node %q is not an eligible historical target",
+			ErrInvalidReturnTarget,
+			target.ID,
+		)
+	}
+	if err := policy.AuthorizeReturn(ctx, request, cloneInstance(snapshot)); err != nil {
+		return nil, NodeResult{}, fmt.Errorf("workflow: authorize return: %w", err)
+	}
 
-	// Host policy observes an isolated pre-transition snapshot and remains the sole authorization authority.
-	if err := policy.AuthorizeWithdrawal(ctx, request.ActorID, cloneInstance(instance)); err != nil {
-		return nil, fmt.Errorf("workflow: authorize withdrawal: %w", err)
+	// Eligible return nodes must activate a concrete waiting task round before any aggregate mutation.
+	handler, err := e.registry.handler(target.Kind)
+	if err != nil {
+		return nil, NodeResult{}, err
 	}
+	result, err := handler.Activate(ctx, ActivationInput{
+		Config: slices.Clone(target.Config),
+		Data:   slices.Clone(snapshot.Data),
+	})
+	if err != nil {
+		return nil, NodeResult{}, fmt.Errorf("workflow: reactivate return target %q: %w", target.ID, err)
+	}
+	if result.Disposition != DispositionWaiting || len(result.Tasks) == 0 {
+		return nil, NodeResult{}, fmt.Errorf(
+			"%w: node %q did not create a waiting task round",
+			ErrInvalidReturnTarget,
+			target.ID,
+		)
+	}
+	return target, result, nil
+}
 
-	// Apply the whole lifecycle transition in memory before issuing its single aggregate CAS write.
-	instance.Status = InstanceStatusWithdrawn
+// applyReturnTransition closes source work and appends one freshly activated target task round.
+//
+// instance is the private loaded aggregate after return audit append. target and result must come from
+// prepareReturn for the same frozen Definition. The method preserves historical tasks and outcomes, replaces
+// current NodeState only after it was captured by the audit record, appends target entry audit, and performs no I/O.
+func (e *Engine) applyReturnTransition(
+	instance *Instance,
+	target *NodeDefinition,
+	result NodeResult,
+) error {
+	// Close only source-active tasks without revising completed or earlier-node assignment history.
+	sourceNodeID := instance.CurrentNodeID
 	for index := range instance.Tasks {
-		if instance.Tasks[index].Status == TaskStatusActive {
+		if instance.Tasks[index].NodeID == sourceNodeID && instance.Tasks[index].Status == TaskStatusActive {
 			instance.Tasks[index].Status = TaskStatusClosed
 		}
 	}
-	e.appendAudit(instance, AuditRecord{
-		Action:  "instance.withdrawn",
-		NodeID:  instance.CurrentNodeID,
-		ActorID: request.ActorID,
-	})
+
+	// Enter the explicit target and append new drafts after all historical tasks retain their original order.
+	instance.CurrentNodeID = target.ID
+	instance.NodeState = slices.Clone(result.State)
+	e.appendAudit(instance, AuditRecord{Action: "node.entered", NodeID: target.ID})
+	return e.applyNodeTasks(instance, target.ID, result.Tasks, false)
+}
+
+// executeInstanceCommand applies the invariant command sequence around one operation-specific transition.
+//
+// command must provide an identity, stable terminal-state error, prepare, audit, and transition callbacks.
+// prepare receives a detached snapshot, while audit and transition receive the private loaded aggregate only
+// after preparation succeeds. The method performs exactly one Load and at most one Save; it increments Version
+// once immediately before CAS persistence and returns a detached snapshot. Any error leaves Store unchanged.
+func (e *Engine) executeInstanceCommand(
+	ctx context.Context,
+	command instanceCommand,
+) (*Instance, error) {
+	// Internal command construction must be complete before storage or callbacks can run.
+	if e == nil || e.store == nil || command.instanceID == "" || command.nonRunningError == nil ||
+		command.prepare == nil || command.audit == nil || command.transition == nil {
+		return nil, fmt.Errorf("%w: instance command is incomplete", ErrInvalidEngine)
+	}
+
+	// Load exactly one caller-owned aggregate and apply the public operation's terminal-state classification.
+	instance, err := e.store.Load(ctx, command.instanceID)
+	if err != nil {
+		return nil, fmt.Errorf("workflow: load %s: %w", command.name, err)
+	}
+	if instance.Status != InstanceStatusRunning {
+		return nil, fmt.Errorf("%w: instance %q is %q", command.nonRunningError, instance.ID, instance.Status)
+	}
+	expectedVersion := instance.Version
+
+	// Preparation and policy observe a detached snapshot, so denial or accidental mutation cannot alter candidate state.
+	if err := command.prepare(cloneInstance(instance)); err != nil {
+		return nil, err
+	}
+	e.appendAudit(instance, command.audit(instance))
+	if err := command.transition(instance); err != nil {
+		return nil, err
+	}
 	instance.Version++
 
-	// Store.Save atomically commits status, tasks, audit, and version or preserves the prior full snapshot.
+	// One aggregate CAS commits every task, state, audit, status, and version change or none of them.
 	if err := e.store.Save(ctx, instance, expectedVersion); err != nil {
-		return nil, fmt.Errorf("workflow: persist withdrawal: %w", err)
+		return nil, fmt.Errorf("workflow: persist %s: %w", command.name, err)
 	}
 	return cloneInstance(instance), nil
+}
+
+// hasEnteredNode reports whether immutable audit history proves that nodeID executed before the current command.
+func hasEnteredNode(audit []AuditRecord, nodeID string) bool {
+	for _, record := range audit {
+		if record.Action == "node.entered" && record.NodeID == nodeID {
+			return true
+		}
+	}
+	return false
 }
 
 // validateCommand checks Engine dependencies and the complete external command boundary before Store access.

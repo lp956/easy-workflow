@@ -5,6 +5,7 @@ package workflow_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"slices"
 	"testing"
@@ -28,6 +29,8 @@ type versionConflictStore struct {
 
 	// saveCalls counts aggregate CAS attempts made through the wrapper.
 	saveCalls int
+	// rejectSaves switches the wrapper from pass-through setup behavior to deterministic CAS failure.
+	rejectSaves bool
 }
 
 // AuthorizeWithdrawal delegates one authorization decision while preserving its returned error.
@@ -39,13 +42,22 @@ func (f withdrawalPolicyFunc) AuthorizeWithdrawal(
 	return f(ctx, actor, instance)
 }
 
-// Save simulates a compare-and-swap loss after Engine has prepared the complete withdrawal candidate.
+// Save delegates setup writes until rejectSaves is enabled, then simulates a compare-and-swap loss.
+//
+// The wrapper counts every attempt. Pass-through failures retain their Store sentinel through wrapping; rejection
+// returns ErrVersionConflict without mutating the embedded Store so lifecycle atomicity can be asserted afterward.
 func (s *versionConflictStore) Save(
-	_ context.Context,
-	_ *workflow.Instance,
-	_ uint64,
+	ctx context.Context,
+	instance *workflow.Instance,
+	expectedVersion uint64,
 ) error {
 	s.saveCalls++
+	if !s.rejectSaves {
+		if err := s.Store.Save(ctx, instance, expectedVersion); err != nil {
+			return fmt.Errorf("save setup aggregate: %w", err)
+		}
+		return nil
+	}
 	return workflow.ErrVersionConflict
 }
 
@@ -315,7 +327,7 @@ func TestEngineWithdrawPreservesSnapshotOnVersionConflict(t *testing.T) {
 
 	// The wrapper exposes normal Create and Load behavior but rejects Engine's sole withdrawal Save.
 	memoryStore := workflow.NewMemoryStore()
-	store := &versionConflictStore{Store: memoryStore}
+	store := &versionConflictStore{Store: memoryStore, rejectSaves: true}
 	engine, started := startWithdrawableInstance(t, store, "conflicting-withdrawal")
 	policy := withdrawalPolicyFunc(func(context.Context, workflow.ActorID, *workflow.Instance) error { return nil })
 
