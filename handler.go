@@ -29,7 +29,7 @@ const (
 	DispositionWaiting Disposition = "waiting"
 	// DispositionContinue follows the edge selected by NodeResult.Outcome.
 	DispositionContinue Disposition = "continue"
-	// DispositionReject terminates the entire instance as rejected without following an edge.
+	// DispositionReject terminates when Outcome is empty and otherwise requires its explicit Definition edge.
 	DispositionReject Disposition = "reject"
 )
 
@@ -54,8 +54,9 @@ type CommandInput struct {
 
 // NodeResult is the only channel through which a handler proposes runtime changes.
 //
-// Waiting results must contain the node's complete task view. Continue results select one declared edge
-// with Outcome. Reject results terminate globally. State is opaque JSON persisted for the active node.
+// Waiting results must contain the node's complete task view. Continue results require one declared edge
+// selected by Outcome. Reject results terminate with an empty outcome or require a matching declared edge
+// for a non-empty outcome. State is opaque JSON persisted for the active node.
 type NodeResult struct {
 	Disposition Disposition
 	Outcome     string

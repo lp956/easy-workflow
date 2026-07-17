@@ -19,6 +19,10 @@ var (
 	ErrInvalidStartRequest = errors.New("workflow: invalid start request")
 	// ErrInvalidCommand means a command violates the active instance, task, or handler contract.
 	ErrInvalidCommand = errors.New("workflow: invalid command")
+	// ErrInvalidWithdrawRequest means withdrawal lacks identity or an explicit host policy.
+	ErrInvalidWithdrawRequest = errors.New("workflow: invalid withdraw request")
+	// ErrInstanceNotRunning means a lifecycle operation targeted an already terminal instance.
+	ErrInstanceNotRunning = errors.New("workflow: instance is not running")
 	// ErrInvalidNodeResult means a handler returned state the engine cannot safely persist.
 	ErrInvalidNodeResult = errors.New("workflow: invalid node result")
 )
@@ -171,6 +175,62 @@ func (e *Engine) Handle(ctx context.Context, command Command) (*Instance, error)
 	return cloneInstance(instance), nil
 }
 
+// Withdraw authorizes and atomically ends one running instance without executing its active node handler.
+//
+// request identities and policy must be non-empty, and ActorID must originate from trusted host context. Policy
+// receives a defensive pre-transition snapshot and may deny with any host-owned error. A successful withdrawal
+// closes every active task, appends one actor-attributed audit record, increments Version once, and commits the
+// full aggregate through Store.Save CAS. Load, policy, cancellation, terminal-state, and CAS errors leave durable
+// state unchanged; returned snapshots are detached from Store ownership.
+func (e *Engine) Withdraw(
+	ctx context.Context,
+	request WithdrawRequest,
+	policy WithdrawalPolicy,
+) (*Instance, error) {
+	// Withdrawal needs persistence and complete trusted identities before any durable state is loaded.
+	if e == nil || e.store == nil {
+		return nil, fmt.Errorf("%w: withdraw store is nil", ErrInvalidEngine)
+	}
+	if request.InstanceID == "" || request.ActorID == "" || policy == nil {
+		return nil, fmt.Errorf("%w: instance, actor, or policy is empty", ErrInvalidWithdrawRequest)
+	}
+
+	// Load one caller-owned aggregate and reject terminal states before invoking host authorization logic.
+	instance, err := e.store.Load(ctx, request.InstanceID)
+	if err != nil {
+		return nil, fmt.Errorf("workflow: withdraw instance: %w", err)
+	}
+	if instance.Status != InstanceStatusRunning {
+		return nil, fmt.Errorf("%w: instance %q is %q", ErrInstanceNotRunning, instance.ID, instance.Status)
+	}
+	expectedVersion := instance.Version
+
+	// Host policy observes an isolated pre-transition snapshot and remains the sole authorization authority.
+	if err := policy.AuthorizeWithdrawal(ctx, request.ActorID, cloneInstance(instance)); err != nil {
+		return nil, fmt.Errorf("workflow: authorize withdrawal: %w", err)
+	}
+
+	// Apply the whole lifecycle transition in memory before issuing its single aggregate CAS write.
+	instance.Status = InstanceStatusWithdrawn
+	for index := range instance.Tasks {
+		if instance.Tasks[index].Status == TaskStatusActive {
+			instance.Tasks[index].Status = TaskStatusClosed
+		}
+	}
+	e.appendAudit(instance, AuditRecord{
+		Action:  "instance.withdrawn",
+		NodeID:  instance.CurrentNodeID,
+		ActorID: request.ActorID,
+	})
+	instance.Version++
+
+	// Store.Save atomically commits status, tasks, audit, and version or preserves the prior full snapshot.
+	if err := e.store.Save(ctx, instance, expectedVersion); err != nil {
+		return nil, fmt.Errorf("workflow: persist withdrawal: %w", err)
+	}
+	return cloneInstance(instance), nil
+}
+
 // validateCommand checks Engine dependencies and the complete external command boundary before Store access.
 //
 // command identity fields must be non-empty and Payload must be absent or valid JSON. The method performs no
@@ -236,6 +296,14 @@ func (e *Engine) advance(ctx context.Context, instance *Instance, plan *compiled
 		case DispositionContinue:
 			outcome = result.Outcome
 		case DispositionReject:
+			// Synchronous handlers use the same explicit outcome contract as command-driven handlers.
+			if result.Outcome != "" {
+				e.appendAudit(instance, AuditRecord{Action: "node.rejected", NodeID: next.ID})
+				outcome = result.Outcome
+				continue
+			}
+
+			// Empty rejection outcomes retain the global terminal behavior.
 			instance.Status = InstanceStatusRejected
 			e.appendAudit(instance, AuditRecord{Action: "instance.rejected", NodeID: next.ID})
 			return nil
@@ -249,9 +317,10 @@ func (e *Engine) advance(ctx context.Context, instance *Instance, plan *compiled
 
 // applyResult validates and applies one handler result to the caller-owned aggregate.
 //
-// plan and node must belong to instance.Definition. Waiting replaces current tasks, continue advances by
-// result.Outcome, and reject terminates without routing. Errors prevent the enclosing Handle operation from
-// saving the mutated snapshot; this method performs no Store I/O itself.
+// plan and node must belong to instance.Definition. Waiting replaces current tasks, continue requires the
+// result outcome route, and reject either terminates with an empty outcome or requires its outcome route.
+// Errors prevent the enclosing Handle operation from saving the mutated snapshot; this method performs no
+// Store I/O itself.
 func (e *Engine) applyResult(
 	ctx context.Context,
 	instance *Instance,
@@ -269,6 +338,14 @@ func (e *Engine) applyResult(
 	case DispositionContinue:
 		return e.advance(ctx, instance, plan, result.Outcome)
 	case DispositionReject:
+		// A handler may name only an outcome; the compiled Definition remains the sole owner of its target node.
+		if result.Outcome != "" {
+			// Record rejection before target entry; callers discard both mutations when route resolution fails.
+			e.appendAudit(instance, AuditRecord{Action: "node.rejected", NodeID: node.ID})
+			return e.advance(ctx, instance, plan, result.Outcome)
+		}
+
+		// An empty outcome preserves the original terminal rejection contract.
 		instance.Status = InstanceStatusRejected
 		e.appendAudit(instance, AuditRecord{Action: "instance.rejected", NodeID: node.ID})
 		return nil

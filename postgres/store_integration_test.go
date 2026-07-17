@@ -7,9 +7,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -22,6 +24,42 @@ import (
 )
 
 const integrationDSNEnvironment = "EASY_WORKFLOW_POSTGRES_DSN"
+
+// withdrawalPolicyFunc adapts an integration-test function to workflow.WithdrawalPolicy.
+type withdrawalPolicyFunc func(context.Context, workflow.ActorID, *workflow.Instance) error
+
+// failingWithdrawalStore delegates reads and creates but corrupts a withdrawal candidate before durable Save.
+type failingWithdrawalStore struct {
+	// Store is the real PostgreSQL adapter receiving the deliberately invalid candidate.
+	workflow.Store
+}
+
+// AuthorizeWithdrawal delegates one host authorization decision and preserves its error identity.
+func (f withdrawalPolicyFunc) AuthorizeWithdrawal(
+	ctx context.Context,
+	actor workflow.ActorID,
+	instance *workflow.Instance,
+) error {
+	return f(ctx, actor, instance)
+}
+
+// Save duplicates one task in an isolated candidate so PostgreSQL must roll back after its parent CAS update.
+func (s failingWithdrawalStore) Save(
+	ctx context.Context,
+	instance *workflow.Instance,
+	expectedVersion uint64,
+) error {
+	// Copy the aggregate fields touched by this fault injection so Engine's candidate remains caller-owned.
+	candidate := *instance
+	candidate.Tasks = slices.Clone(instance.Tasks)
+	if len(candidate.Tasks) > 0 {
+		candidate.Tasks = append(candidate.Tasks, candidate.Tasks[0])
+	}
+	if err := s.Store.Save(ctx, &candidate, expectedVersion); err != nil {
+		return fmt.Errorf("save injected withdrawal candidate: %w", err)
+	}
+	return nil
+}
 
 // TestStoreContract applies the shared adapter contract to isolated PostgreSQL schemas.
 func TestStoreContract(t *testing.T) {
@@ -51,6 +89,59 @@ func TestStoreRollsBackAggregateReplacement(t *testing.T) {
 		t.Fatal("Save() error = nil, want transaction failure")
 	}
 	assertIntegrationSnapshot(t, store, original)
+}
+
+// TestEngineWithdrawalAtomicity verifies successful and failed withdrawals against PostgreSQL transactions.
+func TestEngineWithdrawalAtomicity(t *testing.T) {
+	dsn := requireIntegrationDSN(t)
+	policy := withdrawalPolicyFunc(func(context.Context, workflow.ActorID, *workflow.Instance) error { return nil })
+
+	t.Run("commit full aggregate", func(t *testing.T) {
+		// Persist a running aggregate with one active task before exercising Engine's public lifecycle operation.
+		store := newIsolatedStore(t, dsn)
+		original := integrationInstance("withdrawal-commit", 1)
+		if err := store.Create(t.Context(), original); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+
+		withdrawn, err := workflow.NewEngine(store, nil).Withdraw(t.Context(), workflow.WithdrawRequest{
+			InstanceID: original.ID,
+			ActorID:    "operator-a",
+		}, policy)
+		if err != nil {
+			t.Fatalf("Withdraw() error = %v", err)
+		}
+		if withdrawn.Status != workflow.InstanceStatusWithdrawn || withdrawn.Version != 2 {
+			t.Errorf("withdrawn status/version = %q/%d, want withdrawn/2", withdrawn.Status, withdrawn.Version)
+		}
+		if withdrawn.Tasks[0].Status != workflow.TaskStatusClosed {
+			t.Errorf("withdrawn task status = %q, want %q", withdrawn.Tasks[0].Status, workflow.TaskStatusClosed)
+		}
+		lastAudit := withdrawn.Audit[len(withdrawn.Audit)-1]
+		if lastAudit.Action != "instance.withdrawn" || lastAudit.ActorID != "operator-a" {
+			t.Errorf("withdrawal audit = %#v, want attributed instance.withdrawn", lastAudit)
+		}
+		assertIntegrationSnapshot(t, store, withdrawn)
+	})
+
+	t.Run("roll back full aggregate", func(t *testing.T) {
+		// The injected duplicate reaches child replacement only after PostgreSQL conditionally updates the parent row.
+		store := newIsolatedStore(t, dsn)
+		original := integrationInstance("withdrawal-rollback", 1)
+		if err := store.Create(t.Context(), original); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+		engine := workflow.NewEngine(failingWithdrawalStore{Store: store}, nil)
+
+		_, err := engine.Withdraw(t.Context(), workflow.WithdrawRequest{
+			InstanceID: original.ID,
+			ActorID:    "operator-a",
+		}, policy)
+		if err == nil {
+			t.Fatal("Withdraw() error = nil, want child replacement failure")
+		}
+		assertIntegrationSnapshot(t, store, original)
+	})
 }
 
 // TestStoreLoadsAfterPoolRestart verifies that committed snapshots survive adapter and connection-pool lifetimes.

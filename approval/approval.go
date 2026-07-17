@@ -17,11 +17,11 @@ const (
 	Kind = "approval"
 	// CommandApprove records an assignee's affirmative decision.
 	CommandApprove = "approve"
-	// CommandReject records an assignee's terminal rejection.
+	// CommandReject records an assignee's rejection, which may terminate or follow an explicit Definition edge.
 	CommandReject = "reject"
 	// OutcomeApproved selects the successful outgoing edge after an approval node passes.
 	OutcomeApproved = "approved"
-	// OutcomeRejected is stored on the deciding task when an approval rejects the instance.
+	// OutcomeRejected records the decision and is the only configurable rejection-route outcome.
 	OutcomeRejected = "rejected"
 )
 
@@ -30,7 +30,7 @@ var (
 	ErrInvalidCommand = errors.New("approval: invalid command")
 	// ErrTaskNotActive means a command does not target an active task owned by its declared actor.
 	ErrTaskNotActive = errors.New("approval: task is not active for actor")
-	// ErrInvalidConfig means approval mode or assignee configuration cannot be activated safely.
+	// ErrInvalidConfig means approval mode, assignees, or rejection outcome cannot be activated safely.
 	ErrInvalidConfig = errors.New("approval: invalid config")
 )
 
@@ -46,11 +46,14 @@ const (
 
 // Config is the JSON configuration owned by the official approval handler.
 //
-// Assignees are frozen when the node activates. They must be non-empty and unique. A later resolver-based
+// Assignees are frozen when the node activates. They must be non-empty and unique. RejectedOutcome may be
+// empty for terminal rejection or OutcomeRejected to require an explicit Definition edge. A later resolver-based
 // configuration can produce this same concrete list before activation without changing approval semantics.
 type Config struct {
 	Mode      Mode               `json:"mode"`
 	Assignees []workflow.ActorID `json:"assignees"`
+	// RejectedOutcome is empty for terminal rejection or OutcomeRejected to require graph routing.
+	RejectedOutcome string `json:"rejectedOutcome,omitempty"`
 }
 
 // Handler implements the official approval node without retaining instance-specific state.
@@ -64,7 +67,7 @@ func NewHandler() *Handler {
 	return &Handler{}
 }
 
-// Validate rejects malformed mode and assignee configuration before an instance starts.
+// Validate rejects malformed mode, assignees, or rejection outcome before an instance starts.
 func (h *Handler) Validate(config json.RawMessage) error {
 	_, err := parseConfig(config)
 	return err
@@ -91,7 +94,9 @@ func (h *Handler) Activate(ctx context.Context, input workflow.ActivationInput) 
 // Handle applies one approve or reject command to the frozen task set.
 //
 // The command actor must own the active task. Or-sign completes on the first decision; countersign waits
-// for every approval but rejects immediately. Returned tasks are detached from input.Tasks.
+// for every approval but rejects immediately. RejectedOutcome is either empty for terminal behavior or the
+// fixed OutcomeRejected selector; Engine alone resolves that selector to a Definition edge target. Returned
+// tasks are detached from input.Tasks.
 func (h *Handler) Handle(ctx context.Context, input workflow.CommandInput) (workflow.NodeResult, error) {
 	// Cancellation prevents an abandoned actor command from proposing any state transition.
 	if err := ctx.Err(); err != nil {
@@ -135,7 +140,11 @@ func (h *Handler) Handle(ctx context.Context, input workflow.CommandInput) (work
 		tasks[taskIndex].Status = workflow.TaskStatusCompleted
 		tasks[taskIndex].Outcome = OutcomeRejected
 		closeActiveTasks(tasks)
-		return workflow.NodeResult{Disposition: workflow.DispositionReject, Tasks: tasks}, nil
+		return workflow.NodeResult{
+			Disposition: workflow.DispositionReject,
+			Outcome:     config.RejectedOutcome,
+			Tasks:       tasks,
+		}, nil
 	default:
 		return workflow.NodeResult{}, fmt.Errorf("%w: unsupported command %q", ErrInvalidCommand, input.Name)
 	}
@@ -143,9 +152,10 @@ func (h *Handler) Handle(ctx context.Context, input workflow.CommandInput) (work
 
 // parseConfig decodes and validates the complete approval configuration used by publication and execution.
 //
-// data must contain one Config JSON value with ModeAny or ModeAll and a non-empty set of unique, non-empty
-// assignees. The returned Config owns its decoded assignee slice. Errors retain JSON syntax causes or wrap
-// ErrInvalidConfig; the function performs no I/O and is safe for concurrent calls.
+// data must contain one Config JSON value with ModeAny or ModeAll, a non-empty set of unique, non-empty
+// assignees, and either no rejected outcome or OutcomeRejected. The returned Config owns its decoded assignee
+// slice. Errors retain JSON syntax causes or wrap ErrInvalidConfig; the function performs no I/O and is safe
+// for concurrent calls.
 func parseConfig(data json.RawMessage) (Config, error) {
 	// Decode into fresh storage so handler calls never retain or mutate caller-owned JSON bytes.
 	var config Config
@@ -155,6 +165,10 @@ func parseConfig(data json.RawMessage) (Config, error) {
 	// Only the two documented decision policies have complete runtime semantics.
 	if config.Mode != ModeAny && config.Mode != ModeAll {
 		return Config{}, fmt.Errorf("%w: unsupported mode %q", ErrInvalidConfig, config.Mode)
+	}
+	// Approval exposes one stable rejection selector and never accepts a target node or arbitrary outcome.
+	if config.RejectedOutcome != "" && config.RejectedOutcome != OutcomeRejected {
+		return Config{}, fmt.Errorf("%w: unsupported rejected outcome %q", ErrInvalidConfig, config.RejectedOutcome)
 	}
 	// At least one frozen actor is required or the approval could never receive a valid command.
 	if len(config.Assignees) == 0 {

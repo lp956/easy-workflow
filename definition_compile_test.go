@@ -145,16 +145,21 @@ func TestEngineHandleRejectsMissingOutcomeRoute(t *testing.T) {
 	}
 }
 
-// TestCompileDefinitionRejectsInvalidNodeConfig verifies handler failures have a stable classification and location.
-func TestCompileDefinitionRejectsInvalidNodeConfig(t *testing.T) {
+// TestEngineHandleRejectsMissingRejectedOutcomeRoute verifies configured rejection routing never falls back to terminal.
+func TestEngineHandleRejectsMissingRejectedOutcomeRoute(t *testing.T) {
 	t.Parallel()
 
-	// Keep the graph valid so the compiler reaches the approval handler's configuration contract.
-	builder := workflow.NewBuilder("invalid-approval")
+	// Configure Approval to emit rejected while deliberately declaring only its approved edge.
+	registry := workflow.NewRegistry()
+	if err := registry.Register(approval.Kind, approval.NewHandler()); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	builder := workflow.NewBuilder("missing-rejected-route")
 	builder.Start("start")
 	builder.Node("manager-approval", approval.Kind, approval.Config{
-		Mode:      approval.Mode("unsupported"),
-		Assignees: []workflow.ActorID{"manager-a"},
+		Mode:            approval.ModeAny,
+		Assignees:       []workflow.ActorID{"manager-a"},
+		RejectedOutcome: approval.OutcomeRejected,
 	})
 	builder.End("end")
 	builder.Connect("start", "manager-approval", "")
@@ -163,19 +168,87 @@ func TestCompileDefinitionRejectsInvalidNodeConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build() error = %v", err)
 	}
-	registry := workflow.NewRegistry()
-	if err := registry.Register(approval.Kind, approval.NewHandler()); err != nil {
-		t.Fatalf("Register() error = %v", err)
+	engine := workflow.NewEngine(workflow.NewMemoryStore(), registry)
+	instance, err := engine.Start(context.Background(), definition, workflow.StartRequest{
+		ID:        "missing-rejected-route-1",
+		Initiator: "employee-a",
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
 	}
 
-	// Callers can classify the rule failure while retaining the exact Definition and node location.
-	err = workflow.CompileDefinition(definition, registry)
-	if !errors.Is(err, workflow.ErrInvalidNodeConfig) {
-		t.Fatalf("CompileDefinition() error = %v, want ErrInvalidNodeConfig", err)
+	// Configured routing requires the exact rejected selector and must surface its absence with full context.
+	_, err = engine.Handle(context.Background(), workflow.Command{
+		InstanceID: instance.ID,
+		TaskID:     instance.Tasks[0].ID,
+		ActorID:    instance.Tasks[0].Assignee,
+		Name:       approval.CommandReject,
+	})
+	if !errors.Is(err, workflow.ErrRouteNotFound) {
+		t.Fatalf("Handle() error = %v, want ErrRouteNotFound", err)
 	}
-	if !strings.Contains(err.Error(), `definition "invalid-approval"`) ||
-		!strings.Contains(err.Error(), `node "manager-approval"`) {
-		t.Errorf("CompileDefinition() error = %v, want definition and node context", err)
+	if !strings.Contains(err.Error(), `definition "missing-rejected-route"`) ||
+		!strings.Contains(err.Error(), `node "manager-approval"`) ||
+		!strings.Contains(err.Error(), `outcome "rejected"`) {
+		t.Errorf("Handle() error = %v, want definition, node, and rejected outcome context", err)
+	}
+}
+
+// TestCompileDefinitionRejectsInvalidNodeConfig verifies Approval failures have a stable classification and location.
+func TestCompileDefinitionRejectsInvalidNodeConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		config approval.Config
+	}{
+		{
+			name: "unsupported mode",
+			config: approval.Config{
+				Mode:      approval.Mode("unsupported"),
+				Assignees: []workflow.ActorID{"manager-a"},
+			},
+		},
+		{
+			name: "arbitrary rejected outcome",
+			config: approval.Config{
+				Mode:            approval.ModeAny,
+				Assignees:       []workflow.ActorID{"manager-a"},
+				RejectedOutcome: "arbitrary-node-or-outcome",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Keep the graph valid so compilation reaches the Approval-owned configuration contract.
+			builder := workflow.NewBuilder("invalid-approval")
+			builder.Start("start")
+			builder.Node("manager-approval", approval.Kind, tt.config)
+			builder.End("end")
+			builder.Connect("start", "manager-approval", "")
+			builder.Connect("manager-approval", "end", approval.OutcomeApproved)
+			definition, err := builder.Build()
+			if err != nil {
+				t.Fatalf("Build() error = %v", err)
+			}
+			registry := workflow.NewRegistry()
+			if err := registry.Register(approval.Kind, approval.NewHandler()); err != nil {
+				t.Fatalf("Register() error = %v", err)
+			}
+
+			// Callers can classify the rule failure while retaining the exact Definition and node location.
+			err = workflow.CompileDefinition(definition, registry)
+			if !errors.Is(err, workflow.ErrInvalidNodeConfig) {
+				t.Fatalf("CompileDefinition() error = %v, want ErrInvalidNodeConfig", err)
+			}
+			if !strings.Contains(err.Error(), `definition "invalid-approval"`) ||
+				!strings.Contains(err.Error(), `node "manager-approval"`) {
+				t.Errorf("CompileDefinition() error = %v, want definition and node context", err)
+			}
+		})
 	}
 }
 

@@ -3,6 +3,7 @@
 package workflow
 
 import (
+	"context"
 	"encoding/json"
 	"time"
 )
@@ -28,7 +29,7 @@ const (
 	InstanceStatusCompleted InstanceStatus = "completed"
 	// InstanceStatusRejected means a node rejected the instance as a terminal decision.
 	InstanceStatusRejected InstanceStatus = "rejected"
-	// InstanceStatusWithdrawn means the initiator ended the instance before an approval decision.
+	// InstanceStatusWithdrawn means a host-authorized actor ended the instance while it was running.
 	InstanceStatusWithdrawn InstanceStatus = "withdrawn"
 )
 
@@ -73,7 +74,7 @@ type AuditRecord struct {
 // Instance is a durable snapshot of workflow execution, active assignments, and audit history.
 //
 // Definition is frozen at start so later definition changes cannot alter a running instance. Version is
-// an optimistic concurrency token incremented exactly once per accepted command. Data and NodeState are
+// an optimistic concurrency token incremented exactly once per accepted transition. Data and NodeState are
 // opaque JSON owned by the business module and current node handler respectively.
 type Instance struct {
 	ID            InstanceID      `json:"id"`
@@ -96,6 +97,27 @@ type StartRequest struct {
 	ID        InstanceID      `json:"id"`
 	Initiator ActorID         `json:"initiator"`
 	Data      json.RawMessage `json:"data,omitempty"`
+}
+
+// WithdrawRequest identifies one running instance and its trusted lifecycle actor.
+//
+// ActorID must come from host-established identity rather than an untrusted request body. The request carries
+// no authorization decision; Engine always delegates that decision to an explicit WithdrawalPolicy.
+type WithdrawRequest struct {
+	// InstanceID identifies the aggregate to withdraw and must be non-empty.
+	InstanceID InstanceID `json:"instanceId"`
+	// ActorID identifies the authenticated host principal requesting withdrawal and must be non-empty.
+	ActorID ActorID `json:"actorId"`
+}
+
+// WithdrawalPolicy authorizes a trusted actor against the current durable instance snapshot.
+//
+// Engine supplies a defensive copy before changing status, tasks, audit, or version. Implementations may use
+// host-owned identity, tenant, or business rules and must return a non-nil error to deny withdrawal. They must
+// honor context cancellation for blocking work and must be safe for the host's Engine concurrency model.
+type WithdrawalPolicy interface {
+	// AuthorizeWithdrawal returns nil only when actor may withdraw the supplied pre-transition snapshot.
+	AuthorizeWithdrawal(ctx context.Context, actor ActorID, instance *Instance) error
 }
 
 // Command asks the handler for the current node to process one task action.

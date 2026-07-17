@@ -109,8 +109,8 @@ func TestBuilderRejectsDeadEndBranch(t *testing.T) {
 	}
 }
 
-// TestBuilderRejectsAmbiguousOutcome verifies that one node outcome cannot select multiple targets.
-func TestBuilderRejectsAmbiguousOutcome(t *testing.T) {
+// TestBuilderRejectsAmbiguousRejectedOutcome verifies that rejected cannot select multiple targets.
+func TestBuilderRejectsAmbiguousRejectedOutcome(t *testing.T) {
 	t.Parallel()
 
 	// Both terminal edges use the same outcome, so runtime routing would depend on slice order.
@@ -120,12 +120,12 @@ func TestBuilderRejectsAmbiguousOutcome(t *testing.T) {
 	builder.End("accepted")
 	builder.End("archived")
 	builder.Connect("start", "approval", "")
-	builder.Connect("approval", "accepted", "approved")
-	builder.Connect("approval", "archived", "approved")
+	builder.Connect("approval", "accepted", "rejected")
+	builder.Connect("approval", "archived", "rejected")
 
 	_, err := builder.Build()
-	if !errors.Is(err, workflow.ErrInvalidDefinition) {
-		t.Fatalf("Build() error = %v, want ErrInvalidDefinition", err)
+	if !errors.Is(err, workflow.ErrInvalidDefinition) || !errors.Is(err, workflow.ErrAmbiguousRoute) {
+		t.Fatalf("Build() error = %v, want ErrInvalidDefinition and ErrAmbiguousRoute", err)
 	}
 }
 
