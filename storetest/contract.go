@@ -30,6 +30,7 @@ func Run(t *testing.T, factory Factory) {
 	t.Run("create and load", func(t *testing.T) { runCreateAndLoadContract(t, factory) })
 	t.Run("snapshot ownership", func(t *testing.T) { runSnapshotOwnershipContract(t, factory) })
 	t.Run("compare and swap", func(t *testing.T) { runCompareAndSwapContract(t, factory) })
+	t.Run("append-only audit", func(t *testing.T) { runAppendOnlyAuditContract(t, factory) })
 	t.Run("context cancellation", func(t *testing.T) { runContextCancellationContract(t, factory) })
 }
 
@@ -127,6 +128,41 @@ func runCompareAndSwapContract(t *testing.T, factory Factory) {
 		t.Fatalf("concurrent Create() error = %v", err)
 	}
 	assertConcurrentCAS(t, concurrentStore, concurrentOriginal.ID)
+}
+
+// runAppendOnlyAuditContract verifies that Save may append audit records but cannot rewrite committed history.
+//
+// A rejected rewrite must preserve the prior aggregate and durable version. A valid suffix is committed in order
+// through the same public Save operation used for all other aggregate fields.
+func runAppendOnlyAuditContract(t *testing.T, factory Factory) {
+	t.Helper()
+	t.Parallel()
+
+	store := factory(t)
+	original := contractInstance("append-only-audit", 1)
+	if err := store.Create(t.Context(), original); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	rewrite := contractInstance(original.ID, 2)
+	rewrite.Audit[0].Action = "rewritten"
+	if err := store.Save(t.Context(), rewrite, 1); !errors.Is(err, workflow.ErrInvalidStoreInput) {
+		t.Fatalf("audit rewrite Save() error = %v, want ErrInvalidStoreInput", err)
+	}
+	assertStoredInstance(t, store, original)
+
+	// A new record extends rather than replaces the authoritative existing prefix.
+	appended := contractInstance(original.ID, 2)
+	appended.Audit = append(appended.Audit, workflow.AuditRecord{
+		Action:  "approved",
+		NodeID:  "approval",
+		TaskID:  "task-1",
+		ActorID: "reviewer-1",
+		At:      time.Date(2026, 1, 2, 3, 5, 0, 0, time.UTC),
+	})
+	if err := store.Save(t.Context(), appended, 1); err != nil {
+		t.Fatalf("append audit Save() error = %v", err)
+	}
+	assertStoredInstance(t, store, appended)
 }
 
 // runContextCancellationContract verifies that abandoned Create, Load, and Save calls retain context.Canceled.

@@ -12,7 +12,7 @@ import (
 )
 
 var (
-	// ErrInvalidStoreInput means an instance Store or required aggregate input is absent.
+	// ErrInvalidStoreInput means a Store dependency, required aggregate input, or immutable audit prefix is invalid.
 	ErrInvalidStoreInput = errors.New("workflow: invalid store input")
 	// ErrInstanceNotFound means no workflow instance exists for the requested identifier.
 	ErrInstanceNotFound = errors.New("workflow: instance not found")
@@ -25,8 +25,9 @@ var (
 // Store persists complete aggregate snapshots with optimistic concurrency.
 //
 // Create is insert-only. Load returns a caller-owned snapshot. Save must atomically persist the instance,
-// its tasks, and audit records only when the stored version equals expectedVersion. Implementations must
-// propagate context cancellation and must not retain caller-mutable slices.
+// its tasks, and audit records only when the stored version equals expectedVersion. Existing audit records are
+// immutable and Save may only append a suffix. Implementations must propagate context cancellation and must not
+// retain caller-mutable slices.
 type Store interface {
 	Create(ctx context.Context, instance *Instance) error
 	Load(ctx context.Context, id InstanceID) (*Instance, error)
@@ -129,6 +130,10 @@ func (s *MemoryStore) Save(ctx context.Context, instance *Instance, expectedVers
 	// Reject stale callers at the comparison point so no field can be partially replaced.
 	if stored.Version != expectedVersion {
 		return fmt.Errorf("%w: expected %d, got %d", ErrVersionConflict, expectedVersion, stored.Version)
+	}
+	// Audit order is authoritative, so a candidate may extend but never remove or rewrite the durable prefix.
+	if len(instance.Audit) < len(stored.Audit) || !slices.Equal(instance.Audit[:len(stored.Audit)], stored.Audit) {
+		return fmt.Errorf("%w: save cannot rewrite audit history for %q", ErrInvalidStoreInput, instance.ID)
 	}
 	s.instances[instance.ID] = cloneInstance(instance)
 	return nil
