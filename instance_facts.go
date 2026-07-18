@@ -200,11 +200,10 @@ func (f *instanceFacts) withdraw() {
 	}
 }
 
-// returnTo closes source-active work and appends one fresh task round at an already authorized historical target.
+// returnTo closes source-active work and appends one validated fresh task round at an authorized historical target.
 //
-// targetNodeID and result must come from Engine preparation against this candidate's defensive snapshot. The result
-// must be a non-empty waiting activation whose tasks omit Engine-owned identity. Historical tasks retain order and
-// values; errors classify as ErrInvalidNodeResult and cause the caller to discard the complete candidate.
+// targetNodeID and result must come from prepareReturnNodeResult against this candidate's defensive snapshot. Historical
+// tasks retain order and values. Identity-generation errors cause the caller to discard the complete candidate.
 func (f *instanceFacts) returnTo(targetNodeID string, result NodeResult) error {
 	// Close only the source node's active round, preserving completed decisions and every earlier node's history.
 	sourceNodeID := f.instance.CurrentNodeID
@@ -249,52 +248,24 @@ func (f *instanceFacts) transfer(current Task, newAssignee ActorID) error {
 	return fmt.Errorf("%w: task %q disappeared before transition", ErrTaskNotTransferable, current.ID)
 }
 
-// replaceNodeTasks applies one handler's complete current-node task view without changing other-node task records.
+// applyNodeTaskReplacements writes one prevalidated command task view without changing other-node task records.
 //
-// nodeID identifies the active node and tasks must include every task currently owned by that node. Matching task values
-// replace the stored current-node view exactly, preserving the existing NodeHandler contract; wrong-node, unknown, or
-// omitted identities return ErrInvalidNodeResult. A failure may partially change the private candidate, so callers
-// discard that candidate in full.
-func (f *instanceFacts) replaceNodeTasks(nodeID string, tasks []Task) error {
-	// Index proposed state by immutable task identity so aggregate order and other-node history remain unchanged.
-	updates := make(map[TaskID]Task, len(tasks))
-	for _, task := range tasks {
-		if task.ID == "" || task.NodeID != nodeID {
-			return fmt.Errorf("%w: replacement task identity is invalid", ErrInvalidNodeResult)
-		}
-		// Preserve established behavior: when a handler repeats an ID, its final value is the proposed task state.
-		updates[task.ID] = task
+// replacements must come from prepareNodeTaskReplacements for this exact candidate. The method performs only factual
+// writes, cannot fail, preserves aggregate order, and performs no validation, allocation, or I/O.
+func (f *instanceFacts) applyNodeTaskReplacements(replacements []nodeTaskReplacement) {
+	for _, replacement := range replacements {
+		f.instance.Tasks[replacement.index] = replacement.task
 	}
-
-	// Replace only existing tasks from the active node and consume every proposed identity exactly once.
-	for index := range f.instance.Tasks {
-		if f.instance.Tasks[index].NodeID != nodeID {
-			continue // Tasks owned by other nodes are immutable historical facts for this decision.
-		}
-		updated, exists := updates[f.instance.Tasks[index].ID]
-		if !exists {
-			return fmt.Errorf("%w: handler omitted task %q", ErrInvalidNodeResult, f.instance.Tasks[index].ID)
-		}
-		f.instance.Tasks[index] = updated
-		delete(updates, updated.ID)
-	}
-	if len(updates) != 0 {
-		return fmt.Errorf("%w: handler introduced unknown task", ErrInvalidNodeResult)
-	}
-	return nil
 }
 
-// activateTasks binds one node and fresh cryptographic identities to handler-produced active task drafts.
+// activateTasks binds one node and fresh cryptographic identities to prevalidated active task drafts.
 //
-// Every draft must omit ID, provide a non-empty assignee, and start active. Engine overwrites draft NodeID for backward
-// compatibility with existing handlers. Generated IDs are aggregate identities returned to callers and persisted by
-// Store; errors cause the enclosing candidate to be discarded.
+// tasks must have passed validateActivationTaskDrafts. Engine overwrites draft NodeID for backward compatibility with
+// existing handlers. Generated IDs are aggregate identities returned to callers and persisted by Store; entropy errors
+// cause the enclosing candidate to be discarded.
 func (f *instanceFacts) activateTasks(nodeID string, tasks []Task) error {
 	// Activation appends a new round after all historical tasks rather than replacing prior node-owned records.
 	for _, task := range tasks {
-		if task.ID != "" || task.Assignee == "" || task.Status != TaskStatusActive {
-			return fmt.Errorf("%w: activation task is invalid", ErrInvalidNodeResult)
-		}
 		id, err := newTaskID()
 		if err != nil {
 			return err

@@ -98,7 +98,20 @@ type Handler struct {
 	organization OrganizationAdapter
 }
 
-var _ workflow.NodeHandler = (*Handler)(nil)
+// preparedHandler binds one decoded Approval configuration to its registered handler dependencies for one compiled plan.
+// It is immutable after construction, performs no cross-request caching, and is never serialized or persisted.
+type preparedHandler struct {
+	// handler supplies the long-lived optional organization adapter without retaining request data.
+	handler *Handler
+	// config is the validated request-local decision and assignment policy reused by activation and commands.
+	config Config
+}
+
+var (
+	_ workflow.NodeHandler               = (*Handler)(nil)
+	_ workflow.NodeHandlerConfigPreparer = (*Handler)(nil)
+	_ workflow.PreparedNodeHandler       = (*preparedHandler)(nil)
+)
 
 // NewHandler creates the stateless official approval handler.
 func NewHandler() *Handler {
@@ -119,6 +132,19 @@ func (h *Handler) Validate(config json.RawMessage) error {
 	return err
 }
 
+// PrepareConfig decodes and validates one canonical Approval config for a request-local executable plan.
+//
+// config follows Validate's schema and is not retained as raw bytes. The returned immutable executor reuses the decoded
+// Config for ActivatePrepared and HandlePrepared, keeps only h's host-owned organization dependency, performs no lookup,
+// and is never cached across Engine operations. Errors preserve Approval validation sentinels.
+func (h *Handler) PrepareConfig(config json.RawMessage) (workflow.PreparedNodeHandler, error) {
+	prepared, err := parseConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	return &preparedHandler{handler: h, config: prepared}, nil
+}
+
 // Activate resolves and freezes configured assignees into one active task per actor and waits for decisions.
 //
 // Static assignees require no adapter. A dynamic role policy is resolved exactly once through the host adapter
@@ -135,6 +161,32 @@ func (h *Handler) Activate(ctx context.Context, input workflow.ActivationInput) 
 	if err != nil {
 		return workflow.NodeResult{}, err
 	}
+	return h.activateConfig(ctx, config, input.Data)
+}
+
+// ActivatePrepared activates one Approval node with configuration decoded during executable-plan compilation.
+//
+// input.Data is absent or valid detached business JSON. The method reuses the immutable prepared Config, performs dynamic
+// organization resolution only when configured, retains no input, and returns cancellation or Approval errors unchanged.
+func (h *preparedHandler) ActivatePrepared(
+	ctx context.Context,
+	input workflow.PreparedActivationInput,
+) (workflow.NodeResult, error) {
+	if err := ctx.Err(); err != nil {
+		return workflow.NodeResult{}, fmt.Errorf("approval: activate: %w", err)
+	}
+	return h.handler.activateConfig(ctx, h.config, input.Data)
+}
+
+// activateConfig resolves one validated assignment source and creates detached active task drafts.
+//
+// config must come from parseConfig and data may be absent or valid opaque JSON. Dynamic policies call the explicit host
+// adapter once with detached data; static policies perform no I/O. Returned drafts omit Engine-owned IDs and node identity.
+func (h *Handler) activateConfig(
+	ctx context.Context,
+	config Config,
+	data json.RawMessage,
+) (workflow.NodeResult, error) {
 
 	// Resolve the selected assignment source before constructing any task draft.
 	assignees := config.Assignees
@@ -144,11 +196,12 @@ func (h *Handler) Activate(ctx context.Context, input workflow.ActivationInput) 
 			return workflow.NodeResult{}, fmt.Errorf("%w: %w", ErrInvalidConfig, ErrOrganizationAdapterRequired)
 		}
 		// The adapter receives detached business data so it cannot mutate Engine-owned activation input.
-		assignees, err = h.organization.ResolveRole(ctx, config.Policy.Role, slices.Clone(input.Data))
+		resolved, err := h.organization.ResolveRole(ctx, config.Policy.Role, slices.Clone(data))
 		// Preserve the host cause under one stable Approval classification.
 		if err != nil {
 			return workflow.NodeResult{}, fmt.Errorf("%w: resolve role %q: %w", ErrAssignmentResolution, config.Policy.Role, err)
 		}
+		assignees = resolved
 		// Validate the full population before constructing the first task draft.
 		if err := validateAssignees(assignees); err != nil {
 			return workflow.NodeResult{}, err
@@ -179,23 +232,49 @@ func (h *Handler) Handle(ctx context.Context, input workflow.CommandInput) (work
 	if err != nil {
 		return workflow.NodeResult{}, err
 	}
+	return handleConfig(config, input.Command, input.Tasks)
+}
+
+// HandlePrepared applies an Approval command with configuration decoded during executable-plan compilation.
+//
+// input contains the actor command and complete detached node task view. The method reuses immutable Config, retains no
+// input, performs no I/O, and returns cancellation, task-ownership, or command errors with their existing classifications.
+func (h *preparedHandler) HandlePrepared(
+	ctx context.Context,
+	input workflow.PreparedCommandInput,
+) (workflow.NodeResult, error) {
+	if err := ctx.Err(); err != nil {
+		return workflow.NodeResult{}, fmt.Errorf("approval: handle: %w", err)
+	}
+	return handleConfig(h.config, input.Command, input.Tasks)
+}
+
+// handleConfig applies one command to a validated Approval policy and complete detached task view.
+//
+// config must come from parseConfig. command identifies one active task and owner; tasks contains every round owned by the
+// node. The returned result owns its task slice, performs no I/O, and preserves ErrTaskNotActive or ErrInvalidCommand.
+func handleConfig(
+	config Config,
+	command workflow.Command,
+	inputTasks []workflow.Task,
+) (workflow.NodeResult, error) {
 
 	// Resolve the command task only within the defensive node-owned task snapshot supplied by Engine.
-	tasks := slices.Clone(input.Tasks)
+	tasks := slices.Clone(inputTasks)
 	taskIndex := -1
 	for i := range tasks {
-		if tasks[i].ID == input.TaskID {
+		if tasks[i].ID == command.TaskID {
 			taskIndex = i
 			break
 		}
 	}
 	// Identity, ownership, and active status must all hold before the actor can change the task set.
-	if taskIndex < 0 || tasks[taskIndex].Assignee != input.ActorID || tasks[taskIndex].Status != workflow.TaskStatusActive {
+	if taskIndex < 0 || tasks[taskIndex].Assignee != command.ActorID || tasks[taskIndex].Status != workflow.TaskStatusActive {
 		return workflow.NodeResult{}, ErrTaskNotActive
 	}
 
 	// Apply the actor's decision before calculating whether sibling tasks must remain active or close.
-	switch input.Name {
+	switch command.Name {
 	case CommandApprove:
 		tasks[taskIndex].Status = workflow.TaskStatusCompleted
 		tasks[taskIndex].Outcome = OutcomeApproved
@@ -218,7 +297,7 @@ func (h *Handler) Handle(ctx context.Context, input workflow.CommandInput) (work
 			Tasks:       tasks,
 		}, nil
 	default:
-		return workflow.NodeResult{}, fmt.Errorf("%w: unsupported command %q", ErrInvalidCommand, input.Name)
+		return workflow.NodeResult{}, fmt.Errorf("%w: unsupported command %q", ErrInvalidCommand, command.Name)
 	}
 }
 

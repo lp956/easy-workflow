@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"slices"
 )
 
 // ErrInvalidNodeConfig identifies configuration rejected by JSON validation or its registered handler.
@@ -33,15 +32,26 @@ type definitionAnalysis struct {
 	indegree map[string]int
 }
 
-// compiledDefinition owns a frozen Definition and its deterministic node and outcome lookup indexes.
+// compiledNode binds one canonical node position to its request-local prepared runtime executor.
+//
+// handler is nil only for start and end control nodes. Values are immutable after compilation and are never serialized,
+// persisted, or reused across complete compilation operations.
+type compiledNode struct {
+	// index is the node's stable position in compiledDefinition.definition.Nodes.
+	index int
+	// handler owns prepared business-node configuration for this one executable plan.
+	handler PreparedNodeHandler
+}
+
+// compiledDefinition owns a frozen Definition, deterministic graph indexes, and prepared node executors.
 // It is immutable after construction and safe for concurrent reads within one Engine operation.
 type compiledDefinition struct {
 	// definition is the canonical snapshot whose slice order remains available for persistence compatibility.
 	definition Definition
 	// startID identifies the single control entry validated for unconditional routing.
 	startID string
-	// nodes maps each stable node ID to its position in definition.Nodes without exposing the index publicly.
-	nodes map[string]int
+	// nodes maps each stable node ID to its canonical position and optional prepared business-node executor.
+	nodes map[string]compiledNode
 	// routes maps a source-and-outcome selector to its single validated target node ID.
 	routes map[edgeSelector]string
 }
@@ -76,11 +86,15 @@ func compileDefinition(definition *Definition, registry *Registry) (*compiledDef
 		return nil, fmt.Errorf("definition %q: %w", definitionID, err)
 	}
 
-	// Transfer the analyzed indexes directly into the immutable plan instead of deriving graph data again.
+	// Transfer analyzed positions into runtime nodes without retaining analysis or exposing executable data canonically.
+	compiledNodes := make(map[string]compiledNode, len(analysis.nodes))
+	for id, index := range analysis.nodes {
+		compiledNodes[id] = compiledNode{index: index}
+	}
 	plan := &compiledDefinition{
 		definition: *frozenDefinition,
 		startID:    analysis.startID,
-		nodes:      analysis.nodes,
+		nodes:      compiledNodes,
 		routes:     analysis.routes,
 	}
 
@@ -99,7 +113,7 @@ func compileDefinition(definition *Definition, registry *Registry) (*compiledDef
 		}
 	}
 
-	// Resolve and validate handler-owned configuration only after canonical syntax is known to be sound.
+	// Resolve and prepare handler-owned configuration only after canonical syntax is known to be sound.
 	for index := range plan.definition.Nodes {
 		node := &plan.definition.Nodes[index]
 		if node.Kind == KindStart {
@@ -119,9 +133,9 @@ func compileDefinition(definition *Definition, registry *Registry) (*compiledDef
 				err,
 			)
 		}
-		// Apply the owning handler's complete schema and business-rule validation before execution.
-		// The disposable clone prevents extension code from retaining or mutating immutable plan-owned bytes.
-		if err := handler.Validate(slices.Clone(node.Config)); err != nil {
+		// Preparation performs complete validation once and yields the only executor retained by this request-local plan.
+		prepared, err := prepareRegisteredNodeHandler(handler, node.Config)
+		if err != nil {
 			return nil, fmt.Errorf(
 				"%w: %w: definition %q node %q config: %w",
 				ErrInvalidDefinition,
@@ -131,6 +145,9 @@ func compileDefinition(definition *Definition, registry *Registry) (*compiledDef
 				err,
 			)
 		}
+		compiled := plan.nodes[node.ID]
+		compiled.handler = prepared
+		plan.nodes[node.ID] = compiled
 	}
 
 	// Engine startup always selects the empty outcome, so a named-only start edge is not executable.
@@ -348,12 +365,24 @@ func (p *compiledDefinition) startNode() (*NodeDefinition, error) {
 // id must belong to the frozen Definition. The returned pointer is read-only and remains valid for the
 // plan lifetime; missing IDs return ErrInvalidDefinition with Definition and node context.
 func (p *compiledDefinition) node(id string) (*NodeDefinition, error) {
-	index, exists := p.nodes[id]
+	compiled, exists := p.nodes[id]
 	// A miss indicates a corrupted runtime snapshot because compilation indexed every declared node.
 	if !exists {
 		return nil, fmt.Errorf("%w: definition %q node %q not found", ErrInvalidDefinition, p.definition.ID, id)
 	}
-	return &p.definition.Nodes[index], nil
+	return &p.definition.Nodes[compiled.index], nil
+}
+
+// preparedHandler returns one business node's request-local executable config without consulting Registry again.
+//
+// id must identify a compiled non-control node. The returned executor is owned by the plan, is never persisted, and may
+// be used only during the enclosing Engine operation. Missing or control-node handlers return ErrHandlerNotFound.
+func (p *compiledDefinition) preparedHandler(id string) (PreparedNodeHandler, error) {
+	compiled, exists := p.nodes[id]
+	if !exists || compiled.handler == nil {
+		return nil, fmt.Errorf("%w: %q", ErrHandlerNotFound, id)
+	}
+	return compiled.handler, nil
 }
 
 // nextNode resolves exactly one compiled outcome route from source to its target node.
