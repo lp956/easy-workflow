@@ -13,6 +13,245 @@
 
 组织目录同样不属于 core。`approval.OrganizationAdapter` 只是宿主可选实现的边界；静态 assignee 不需要目录。待办、已办和搜索属于 adapter 查询投影，不会扩张 command-side `workflow.Store`。
 
+## 项目入口、注册点与流程创建位置
+
+先给出最常用的定位结论：这个仓库是一个 **Go library**，不是可独立运行的服务，因此仓库内没有 `main.go`、HTTP server 或自动执行的启动函数。宿主应用需要在自己的 `main.go`、依赖注入模块或服务启动模块中显式装配它。
+
+| 要找的能力 | 文件 | 关键类型或函数 | 说明 |
+| --- | --- | --- | --- |
+| 宿主装配示例 | [`example_test.go`](example_test.go) | `Example`、`ExampleDefinitionPublisher_versions` | 最接近完整应用入口的可执行示例，串起注册、Engine 创建、Definition 创建、启动和命令处理 |
+| Engine 创建 | [`engine.go`](engine.go) | `NewEngine` | 把 `Store` 和 `Registry` 注入 Engine；构造本身不连接数据库、不启动 goroutine |
+| 流程实例启动 | [`engine.go`](engine.go) | `Engine.Start`、`Engine.StartPublished` | `Start` 使用调用方提供的 Definition；`StartPublished` 先读取指定的不可变版本，再进入 `Start` |
+| handler 注册中心 | [`handler.go`](handler.go) | `Registry`、`NewRegistry`、`Registry.Register` | `kind -> NodeHandler` 的唯一运行时映射；没有全局注册，也不会在 import 时自动注册 |
+| Approval 注册实现 | [`approval/approval.go`](approval/approval.go) | `approval.Kind`、`approval.NewHandler`、`approval.NewHandlerWithOrganization` | 宿主创建 Approval handler 后，调用 `registry.Register(approval.Kind, handler)` |
+| Condition 注册实现 | [`condition/condition.go`](condition/condition.go) | `condition.Kind`、`condition.NewHandler` | 宿主创建 Condition handler 后，调用 `registry.Register(condition.Kind, handler)` |
+| 代码方式创建流程 | [`definition.go`](definition.go) | `NewBuilder`、`Start`、`Node`、`End`、`Connect`、`Build` | 构造 canonical `Definition`；`Build` 负责结构校验，但不持久化、不启动实例 |
+| JSON 方式创建流程 | [`definition.go`](definition.go) | `ParseDefinition` | 将设计器或 Web 传入的 JSON 解码为同一个 canonical `Definition` 并做结构校验 |
+| Definition 完整编译 | [`compiler.go`](compiler.go) | `CompileDefinition`、`compileDefinition` | 校验图、路由、节点 kind 是否已注册以及节点配置；生成的执行计划只在当前请求内使用 |
+| Definition 发布 | [`publication.go`](publication.go) | `DefinitionPublisher`、`Publish`、`PublishJSON` | 在持久化之前完整编译，并通过 `DefinitionVersionWriter` 分配严格递增的不可变版本 |
+| Instance 持久化接口 | [`store.go`](store.go) | `Store`、`MemoryStore` | Engine 的 command-side 存储端口；`Create` 创建实例，`Load` 读取快照，`Save` 做乐观并发 CAS |
+| PostgreSQL 持久化实现 | [`postgres/store.go`](postgres/store.go) | `postgres.New`、`Store.Create`、`Store.Load`、`Store.Save` | 使用宿主传入的 `pgxpool.Pool` 持久化完整 Instance 聚合 |
+
+需要特别区分三个“创建”动作：
+
+1. `workflow.NewBuilder(...)` 创建的是 **流程定义 Definition**，位置在 [`definition.go`](definition.go)。
+2. `DefinitionPublisher.Publish(...)` 创建的是 **Definition 的不可变发布版本**，位置在 [`publication.go`](publication.go)。
+3. `engine.Start(...)` 创建的是 **一次实际运行的流程实例 Instance**，编排位置在 [`engine.go`](engine.go)，最终通过 [`store.go`](store.go) 的 `Store.Create` 落库。
+
+## 完整文件结构
+
+下面按运行职责列出仓库结构。`*_test.go` 不参与生产构建，但它们是各公开契约和调用方式的可执行说明。
+
+```text
+easy-workflow/
+├─ go.mod / go.sum                         # Go module、Go 版本和 pgx 依赖
+├─ README.md                               # 使用、架构、接入与运行说明
+├─ LICENSE                                 # 许可证
+│
+├─ doc.go                                  # core package 总体边界与 package documentation
+├─ definition.go                           # Definition、Node、Edge、Builder、JSON 解析、结构校验入口
+├─ compiler.go                             # 图分析、路由索引、handler 解析、配置准备和请求内执行计划
+├─ handler.go                              # NodeHandler 协议、NodeResult、Registry 和显式注册入口
+├─ handler_preparation.go                  # 新旧 handler 的请求内 PreparedNodeHandler 适配
+├─ runtime.go                              # Instance、Task、Audit、Command 和生命周期请求/策略类型
+├─ engine.go                               # Start/Handle/Withdraw/Return/Transfer 的总编排与持久化边界
+├─ instance_facts.go                       # Instance、Task、Audit 的唯一包内事实变更入口
+├─ node_result_application.go              # NodeResult 的分阶段校验、归一化和事实应用
+├─ store.go                                # command-side Store 契约及 MemoryStore 参考实现
+├─ publication.go                          # Definition 发布、版本读写契约及 MemoryDefinitionStore
+│
+├─ approval/
+│  ├─ approval.go                          # 官方人工审批节点、或签/会签、静态/动态分配
+│  ├─ preparation_test.go                  # Approval 配置预编译与旧执行路径一致性
+│  └─ assignment_integration_test.go       # 组织角色解析、冻结 assignee、失败原子性
+├─ condition/
+│  ├─ condition.go                         # 官方受限条件节点、JSON Pointer 和类型化操作符
+│  ├─ condition_test.go                    # 条件匹配、类型、确定性和错误边界
+│  ├─ preparation_test.go                  # Condition 配置预编译一致性
+│  └─ integration_test.go                  # Builder、JSON 发布和运行时分支示例
+│
+├─ postgres/
+│  ├─ doc.go                               # PostgreSQL adapter 的 package 边界
+│  ├─ store.go                             # command Store 的事务、CAS、Create/Load/Save
+│  ├─ codec.go                             # 聚合与数据库行之间的无损编解码
+│  ├─ migration.go                         # 只暴露迁移文件，不自动执行迁移
+│  ├─ projection.go                        # Projection 公共类型、查询契约和构造函数
+│  ├─ projection_query.go                  # 查询族共享的 limit、scope、取消等边界校验
+│  ├─ projection_task.go                   # 待办/已办 Task 查询、keyset 与页面构造
+│  ├─ projection_instance.go               # 我发起的 Instance 查询、keyset 与页面构造
+│  ├─ projection_continuation.go           # 版本化 opaque continuation 编解码
+│  ├─ projection_write.go                  # Store 事务内派生并刷新查询投影行
+│  ├─ migrations/
+│  │  ├─ 0001_init.up.sql                  # Instance、Definition、Task、Audit 初始 schema
+│  │  ├─ 0001_init.down.sql                # 初始 schema 回滚
+│  │  ├─ 0002_query_projection.up.sql      # 查询投影 schema
+│  │  └─ 0002_query_projection.down.sql    # 查询投影 schema 回滚
+│  ├─ migration_test.go                    # 迁移暴露与 adapter 构造测试
+│  ├─ store_integration_test.go            # Store 契约、事务回滚、CAS、重启恢复
+│  ├─ query_integration_test.go            # Projection 排序、scope、分页和事务可见性
+│  ├─ projection_validation_test.go        # 旧 Cursor API 的参数与家族校验
+│  └─ projection_continuation_test.go      # 新 continuation API 的编码与分页校验
+│
+├─ definitiontest/
+│  └─ contract.go                          # Definition writer/reader/repository adapter 契约测试套件
+├─ storetest/
+│  └─ contract.go                          # 任意 command Store adapter 都应通过的共享契约测试
+│
+├─ example_test.go                         # 端到端可执行示例；建议从这里开始阅读
+├─ definition_test.go                      # Builder 与图结构校验
+├─ definition_compile_test.go              # 编译、配置校验、路由确定性和失败原子性
+├─ definition_seams_test.go                # Publisher/Reader capability seam
+├─ definition_repository_contract_test.go  # MemoryDefinitionStore 契约入口
+├─ publication_test.go                     # 发布版本、并发分配和快照冻结
+├─ engine_test.go                          # Approval 主流程：或签、会签、拒绝路由
+├─ engine_node_result_test.go              # 非法 NodeResult 的原子拒绝
+├─ handler_preparation_test.go              # Prepared handler 和 legacy handler 兼容
+├─ store_test.go                           # MemoryStore 契约入口
+├─ withdraw_test.go                        # 撤回、授权、终态和并发冲突
+├─ return_test.go                          # 退回历史节点、重新激活和授权
+├─ transfer_test.go                        # 转办 active Task、授权和并发冲突
+│
+├─ docs/architecture/
+│  ├─ definition-repository-seams.md       # Definition 读写 capability 分离决策
+│  ├─ runtime-deep-modules.md              # NodeResult application 与配置准备决策
+│  └─ postgres-projection-continuations.md # Projection continuation 兼容决策
+├─ PRD.md                                  # 总体产品需求与范围
+├─ PRD-definition-compilation-module.md    # Definition 编译模块需求
+├─ PRD-definition-repository-seam.md       # Definition repository seam 需求
+├─ PRD-instance-audit-module.md            # Instance/Task/Audit 事实模块需求
+├─ PRD-postgres-projection-module.md       # PostgreSQL Projection 模块需求
+├─ go-workflow-research.md                 # 前期工作流方案调研
+└─ issues/                                 # 按依赖顺序保存的实现 issue 与交付记录
+```
+
+## 从宿主启动到流程运行的调用链
+
+### 1. 宿主应用启动与依赖装配
+
+宿主自己的入口文件通常是 `cmd/<service>/main.go` 或内部的 composition root；本仓库不替宿主提供该文件。推荐装配顺序如下：
+
+```text
+宿主 main.go / DI module
+  ├─ 创建 pgxpool.Pool 或 workflow.NewMemoryStore()
+  ├─ workflow.NewRegistry()
+  ├─ registry.Register(approval.Kind, approval.NewHandler())
+  ├─ registry.Register(condition.Kind, condition.NewHandler())   # 使用 Condition 时
+  ├─ workflow.NewEngine(store, registry)
+  └─ workflow.NewDefinitionPublisher(definitionWriter, registry) # 需要发布版本时
+```
+
+注册必须在服务开始接收启动或命令请求前完成。`Registry` 虽然支持并发访问，但 Engine 持有同一个 Registry 指针；运行期间临时增加 kind 会让不同时间的请求看到不同的可用行为。重复注册同一个 kind 会返回 `workflow.ErrHandlerExists`，不会覆盖旧 handler。
+
+`start` 和 `end` 是 core 识别的控制节点，由 [`compiler.go`](compiler.go) 和 [`engine.go`](engine.go) 直接处理，不需要注册 handler。`approval`、`condition` 以及宿主自定义的业务节点都必须显式注册。
+
+### 2. 创建 Definition
+
+代码创建入口位于 [`definition.go`](definition.go)：
+
+```text
+NewBuilder(definitionID)
+  -> Start(nodeID)
+  -> Node(nodeID, registeredKind, config)
+  -> Connect(from, to, outcome)
+  -> End(nodeID)
+  -> Build()
+       -> Definition.Validate()
+       -> compiler.go/analyzeDefinition()
+```
+
+`Build` 检查的是 canonical 图结构，例如唯一 start、节点引用、DAG、可达性、能否到达 end、路由是否确定等。业务节点的 kind 是否已经注册、其 config 是否符合 handler 规则，则由 [`compiler.go`](compiler.go) 的 `CompileDefinition` 在发布或启动前检查。
+
+Web 设计器不需要另一套模型：JSON 通过 `ParseDefinition` 进入同一个 `Definition`。因此 Builder 与 Web JSON 最终共享完全相同的结构校验、编译、发布和运行路径。
+
+### 3. 发布 Definition 版本
+
+发布链路位于 [`publication.go`](publication.go)：
+
+```text
+DefinitionPublisher.Publish(definition)
+  -> compiler.go/CompileDefinition(definition, registry)
+       -> 校验图结构
+       -> 按 NodeDefinition.Kind 从 handler.go/Registry 查找 handler
+       -> Validate 或 PrepareConfig 校验每个业务节点配置
+  -> DefinitionVersionWriter.CreateVersion(...)
+       -> 为同一 Definition.ID 原子分配下一版本
+       -> 保存不可变防御性快照
+```
+
+`PublishJSON` 只是在这条链路前增加 `ParseDefinition`。编译失败不会调用 writer，因此不会占用版本号。当前 core 提供的 `MemoryDefinitionStore` 同时实现 writer 和 reader；PostgreSQL command Store 不会自动充当 Definition repository。
+
+### 4. 启动一次 Instance
+
+运行入口位于 [`engine.go`](engine.go)：
+
+```text
+Engine.Start(ctx, definition, StartRequest)
+  -> 校验 Engine 依赖、Instance ID、Initiator 和业务 JSON
+  -> compiler.go/compileDefinition() 冻结请求内执行计划
+  -> instance_facts.go/startInstanceFacts() 创建候选聚合
+  -> engine.go/advance() 从 start 沿图推进
+       -> 进入业务节点
+       -> PreparedNodeHandler.ActivatePrepared()
+       -> node_result_application.go 校验并应用 NodeResult
+       -> waiting: 创建 active Task 并停止推进
+       -> continue: 按 outcome 继续寻找下一节点
+       -> reject: 终止或沿声明的拒绝 outcome 继续
+       -> end: 标记 Instance completed
+  -> Store.Create() 原子保存完整 Instance
+  -> 返回与 Store 脱离的快照
+```
+
+`Engine.StartPublished` 位于同一文件，但会先调用 `DefinitionReader.Load(id, version)` 读取精确版本，然后复用 `Start`。它不会自动回退到最新版本；如需启动最新版本，应先 `LoadLatest` 固定版本，再按该精确版本调用 `StartPublished`。
+
+### 5. 处理审批或其他节点命令
+
+任务命令入口仍在 [`engine.go`](engine.go) 的 `Engine.Handle`：
+
+```text
+Engine.Handle(command)
+  -> Store.Load(instanceID) 读取一个防御性快照
+  -> compileDefinition(instance.Definition, registry)
+  -> 找到 CurrentNodeID 对应的 PreparedNodeHandler
+  -> handler.HandlePrepared(command + data + state + 当前节点完整 tasks)
+  -> node_result_application.go 校验 handler 返回值
+  -> instance_facts.go 写入 Task、NodeState 和 Audit 事实
+  -> 如需跳转则 engine.go/advance() 继续推进
+  -> Instance.Version + 1
+  -> Store.Save(candidate, expectedVersion) 做原子 CAS
+```
+
+handler 不能直接访问 Store、修改 Instance 或任意指定下一个节点。它只能返回声明式 `NodeResult`；Engine 校验结果后，才通过 `instance_facts.go` 改变事实，并由编译后的路由表解释 outcome。这样 handler 错误、非法结果或版本冲突都不会留下部分持久化状态。
+
+### 6. 撤回、退回与转办
+
+三类生命周期命令也在 [`engine.go`](engine.go)：
+
+| 操作 | Engine 入口 | 请求与授权接口 | 主要事实变化 |
+| --- | --- | --- | --- |
+| 撤回 | `Engine.Withdraw` | `runtime.go` 的 `WithdrawRequest`、`WithdrawalPolicy` | 关闭 active Task，状态改为 withdrawn，追加 Audit |
+| 退回 | `Engine.Return` | `runtime.go` 的 `ReturnRequest`、`ReturnPolicy` | 校验目标曾经进入过，重新激活目标节点并创建新一轮 Task |
+| 转办 | `Engine.Transfer` | `runtime.go` 的 `TransferRequest`、`TransferPolicy` | 只替换指定 active Task 的 assignee，保留历史并追加 Audit |
+
+它们共享 `engine.go` 的加载、运行态校验、版本推进和 CAS 保存骨架；业务授权由宿主实现的 policy 决定，Engine 不从不可信请求体推断权限。
+
+## 按需求快速定位文件
+
+| 如果要修改…… | 首先查看 | 通常还要联动查看 |
+| --- | --- | --- |
+| Definition 字段、节点或边的数据模型 | [`definition.go`](definition.go) | `compiler.go`、`postgres/codec.go`、迁移、Definition 与发布测试 |
+| 图校验、路由规则、节点配置编译 | [`compiler.go`](compiler.go) | `definition.go`、`handler_preparation.go`、`definition_compile_test.go` |
+| 新的业务节点类型 | 新建独立 package | `handler.go` 的接口、宿主 `Registry.Register`、集成测试 |
+| Approval 模式或人员分配 | [`approval/approval.go`](approval/approval.go) | Approval 的 preparation/assignment tests |
+| Condition 操作符或 JSON 规则 | [`condition/condition.go`](condition/condition.go) | Condition 单元测试与 integration test |
+| Instance/Task/Audit 公共字段 | [`runtime.go`](runtime.go) | `instance_facts.go`、`postgres/codec.go`、schema 与投影写入 |
+| Start、审批、撤回、退回、转办编排 | [`engine.go`](engine.go) | `node_result_application.go`、`instance_facts.go`、对应 `*_test.go` |
+| NodeResult 合法性或任务替换规则 | [`node_result_application.go`](node_result_application.go) | `handler.go`、`instance_facts.go`、`engine_node_result_test.go` |
+| command Store 契约 | [`store.go`](store.go) | `storetest/contract.go`、`postgres/store.go` |
+| Definition 发布与版本能力 | [`publication.go`](publication.go) | `definitiontest/contract.go`、`definition_seams_test.go` |
+| PostgreSQL 事务或 CAS | [`postgres/store.go`](postgres/store.go) | `codec.go`、`projection_write.go`、迁移与 integration tests |
+| 待办、已办、我发起的查询 | [`postgres/projection.go`](postgres/projection.go) | `projection_task.go`、`projection_instance.go`、`projection_continuation.go` |
+| 数据库 schema | [`postgres/migrations`](postgres/migrations) | `codec.go`、`store.go`、`projection_write.go`、migration tests |
+
 ## 安装
 
 core 和 Approval extension 可以使用标准 Go package 命令一起引入：
