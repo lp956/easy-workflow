@@ -151,13 +151,68 @@ go test ./condition -run '^ExampleHandler_webJSON$' -count=1
 3. 宿主把 pool 传给 `postgres.New(pool)`。`Create` 和 `Save` 各自在单个数据库事务中提交 Instance、Definition 快照、business data、NodeState、Task、append-only Audit 和查询投影；任一步失败都会回滚。
 4. `Save` 使用数据库条件版本更新实现跨进程 CAS。陈旧写入返回可由 `errors.Is` 识别的 `workflow.ErrVersionConflict`。
 
+### 查询投影
+
+`postgres.NewProjection(pool)` 借用同一个宿主所有的 pool，构造时不连接数据库、不执行迁移，且可被并发调用。Projection 只应用宿主已经计算出的 actor 和授权 scope，不发现租户、组织或权限。
+
+| 方法 | 返回值 | 语义 |
+| --- | --- | --- |
+| `Worklist` | `Page[TaskProjection]` | actor 在运行中 Instance 里的 active 冻结任务 |
+| `Participated` | `Page[TaskProjection]` | actor 已 completed 或 closed 的冻结任务 |
+| `Initiated` | `Page[InstanceProjection]` | actor 发起的运行中及终态 Instance |
+
+```go
+projection := postgres.NewProjection(pool)
+const pageLimit = 50 // 使用公开契约的默认页大小，并在连续请求间保持不变。
+
+// 首次查询应用宿主计算的完整授权 scope；Projection 不会补充或放宽它。
+page, err := projection.Worklist(ctx, postgres.ActorQuery{
+	ActorID: actorID,
+	Scope: postgres.QueryScope{
+		InstanceIDs: authorizedInstanceIDs,
+	},
+	Page: postgres.PageRequest{Limit: pageLimit},
+})
+if err != nil {
+	// 验证、取消或数据库错误都不会产生可继续使用的部分页面。
+	return err
+}
+
+// page.Next 非 nil 时，把它原样传回同一个 Task 查询族以读取下一页。
+if page.Next != nil {
+	// 连续请求保持 actor、scope 和 limit 不变，只替换服务端返回的 cursor。
+	nextPage, err := projection.Worklist(ctx, postgres.ActorQuery{
+		ActorID: actorID,
+		Scope: postgres.QueryScope{
+			InstanceIDs: authorizedInstanceIDs,
+		},
+		Page: postgres.PageRequest{Limit: pageLimit, After: page.Next},
+	})
+	if err != nil {
+		// 下一页失败时保留原页，调用方可按错误原因决定是否重试。
+		return err
+	}
+	page = nextPage
+}
+```
+
+查询输入遵守以下兼容契约：
+
+- `QueryScope.InstanceIDs == nil` 表示不附加 Instance 限制；非 nil 空 slice 表示拒绝全部 Instance，并直接返回非 nil 空 `Items`；非空 slice 只允许列出的 Instance。
+- `PageRequest.Limit == 0` 使用默认值 50；显式值必须位于 `[1, 200]`，否则返回可由 `errors.Is` 识别的 `postgres.ErrInvalidProjectionQuery`。
+- Task 查询按审计时间降序、InstanceID 和 TaskID 升序稳定分页；Worklist 与 Participated 共享 Task cursor 形状。Initiated 使用不含 TaskID 的 Instance cursor，跨家族或字段不完整的 cursor 会被拒绝。
+- `Next` 只在同一查询快照中观察到后续行时返回，末页为 nil；成功时 `Items` 始终非 nil。
+- actor、scope、cursor 和 limit 全部作为 PostgreSQL 参数传递，不参与 SQL 文本拼接。
+
+内部实现按 Task 与 Instance 两个查询族分别收拢输入规范化、keyset 参数、扫描和分页构造，只共享 limit、取消和 scope 值转换等完全一致的边界行为；新增查询族不需要引入通用 repository 或 mock-only executor。
+
 集成测试要求调用方显式提供测试数据库，不会启动容器或使用隐式本机默认值：
 
 ```bash
 EASY_WORKFLOW_POSTGRES_DSN='postgres://user:password@localhost:5432/easy_workflow_test?sslmode=disable' go test ./postgres -count=1
 ```
 
-测试会为各场景创建隔离 schema，并覆盖公共 Store 契约、事务回滚、并发 CAS、pool 重启后的读取、完整快照恢复及查询投影。未设置 `EASY_WORKFLOW_POSTGRES_DSN` 时，数据库相关用例会明确 skip。
+测试会为各场景创建隔离 schema，并覆盖公共 Store 契约、事务回滚、并发 CAS、pool 重启后的读取、完整快照恢复，以及 Projection 的 scope、稳定排序、cursor、分页边界和事务可见性。未设置 `EASY_WORKFLOW_POSTGRES_DSN` 时，数据库相关用例会明确 skip。
 
 ## 公开契约
 
