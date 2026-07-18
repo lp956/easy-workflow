@@ -5,6 +5,7 @@ package postgres_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -14,6 +15,23 @@ import (
 	workflow "github.com/lvpeng/easy-workflow"
 	"github.com/lvpeng/easy-workflow/approval"
 	"github.com/lvpeng/easy-workflow/postgres"
+)
+
+const (
+	// projectionOmittedLimit is the PageRequest sentinel that selects the default page size.
+	projectionOmittedLimit = 0
+	// projectionMinimumLimit is the smallest documented explicit PageRequest limit.
+	projectionMinimumLimit = 1
+	// projectionDefaultLimit is the documented item count selected by a zero PageRequest limit.
+	projectionDefaultLimit = 50
+	// projectionMaximumLimit is the documented largest accepted explicit PageRequest limit.
+	projectionMaximumLimit = 200
+	// projectionInvalidLowerLimit is the first integer below the accepted explicit range.
+	projectionInvalidLowerLimit = -1
+	// projectionInvalidUpperLimit is the first integer above the accepted explicit range.
+	projectionInvalidUpperLimit = projectionMaximumLimit + 1
+	// projectionLimitFixtureCount leaves exactly one look-ahead row beyond the maximum visible page.
+	projectionLimitFixtureCount = projectionInvalidUpperLimit
 )
 
 // projectionReturnPolicyFunc adapts one test authorization decision to workflow.ReturnPolicy.
@@ -54,46 +72,62 @@ func (f projectionRoleResolverFunc) ResolveRole(
 }
 
 // TestProjectionWorklistReturnsActiveFrozenAssignment verifies one committed activation is immediately queryable.
+//
+// t owns an isolated schema containing in-scope and out-of-scope assignments for the same actor. The public Worklist
+// call must return only the authorized instance with complete frozen fields and no continuation cursor.
 func TestProjectionWorklistReturnsActiveFrozenAssignment(t *testing.T) {
+	// Build one engine whose commands and projection writes share the same caller-owned PostgreSQL pool.
 	dsn := requireIntegrationDSN(t)
 	pool := newProjectionPool(t, dsn)
 	store := postgres.New(pool)
 	registry := workflow.NewRegistry()
+	// Register the only handler before either instance starts so both fixtures resolve identical assignments.
 	if err := registry.Register(approval.Kind, approval.NewHandler()); err != nil {
 		t.Fatalf("Register() error = %v", err)
 	}
 	definition := projectionApprovalDefinition(t, "expense", []workflow.ActorID{"reviewer-a"})
+	engine := workflow.NewEngine(store, registry)
 
 	// Start commits the aggregate and its query projection in the same PostgreSQL transaction.
-	instance, err := workflow.NewEngine(store, registry).Start(t.Context(), definition, workflow.StartRequest{
+	instance, err := engine.Start(t.Context(), definition, workflow.StartRequest{
 		ID:        "expense-1",
 		Initiator: "requester-a",
 	})
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
+	// A second assignment for the same actor must remain invisible because the host does not include it in scope.
+	if _, err := engine.Start(t.Context(), definition, workflow.StartRequest{
+		ID:        "expense-2",
+		Initiator: "requester-a",
+	}); err != nil {
+		t.Fatalf("Start(out-of-scope) error = %v", err)
+	}
+
+	// Query only the first instance so the item count detects any ignored or broadened populated scope.
 	page, err := postgres.NewProjection(pool).Worklist(t.Context(), postgres.ActorQuery{
 		ActorID: "reviewer-a",
 		Scope: postgres.QueryScope{
 			InstanceIDs: []workflow.InstanceID{instance.ID},
 		},
-		Page: postgres.PageRequest{Limit: 10},
 	})
 	if err != nil {
 		t.Fatalf("Worklist() error = %v", err)
 	}
 
 	// The public row joins frozen definition identity, instance state, assignment state, and audit times.
-	if len(page.Items) != 1 {
-		t.Fatalf("Worklist() item count = %d, want 1", len(page.Items))
+	if len(page.Items) != projectionMinimumLimit {
+		t.Fatalf("Worklist() item count = %d, want %d", len(page.Items), projectionMinimumLimit)
 	}
 	item := page.Items[0]
+	// Every joined identity and status must come from the authorized committed aggregate.
 	if item.DefinitionID != definition.ID || item.DefinitionVersion != definition.Version ||
 		item.InstanceID != instance.ID || item.InstanceStatus != workflow.InstanceStatusRunning ||
 		item.NodeID != "review" || item.TaskID != instance.Tasks[0].ID ||
 		item.ActorID != "reviewer-a" || item.TaskStatus != workflow.TaskStatusActive {
 		t.Errorf("Worklist() item = %#v, want active frozen assignment", item)
 	}
+	// Both public audit pointers must remain populated from the same committed projection snapshot.
 	if item.StartedAt == nil || item.LastAuditAt == nil {
 		t.Errorf("Worklist() audit times = (%v, %v), want both populated", item.StartedAt, item.LastAuditAt)
 	}
@@ -244,23 +278,26 @@ func TestProjectionInitiatedPagesRunningAndCompletedInstances(t *testing.T) {
 }
 
 // TestProjectionTaskPaginationBreaksEqualTimesByIdentity verifies equal audit timestamps cannot duplicate or skip rows.
+//
+// t owns an isolated schema with two equal-time instances. Worklist and Initiated must page both identities exactly
+// once in ascending tie-breaker order and expose nil Next only after the second committed row.
 func TestProjectionTaskPaginationBreaksEqualTimesByIdentity(t *testing.T) {
 	dsn := requireIntegrationDSN(t)
 	pool := newProjectionPool(t, dsn)
 	store := postgres.New(pool)
-	equalTime := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC)
+	equalTime := time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC) // Fixed UTC input makes identity the only changing key.
 	for _, instanceID := range []workflow.InstanceID{"tie-a", "tie-b"} {
 		instance := &workflow.Instance{
 			ID: instanceID,
 			Definition: workflow.Definition{
 				ID:      "tie-definition",
-				Version: 3,
+				Version: 3, // A non-default frozen version also exercises projection version decoding.
 			},
 			Status:        workflow.InstanceStatusRunning,
 			Initiator:     "requester-a",
 			CurrentNodeID: "review",
 			Tasks: []workflow.Task{{
-				ID:       workflow.TaskID(instanceID + "-task"),
+				ID:       workflow.TaskID(instanceID + "-task"), // Instance-derived identity stays unique and ordered.
 				NodeID:   "review",
 				Assignee: "reviewer-a",
 				Status:   workflow.TaskStatusActive,
@@ -271,8 +308,9 @@ func TestProjectionTaskPaginationBreaksEqualTimesByIdentity(t *testing.T) {
 				ActorID: "requester-a",
 				At:      equalTime,
 			}},
-			Version: 1,
+			Version: 1, // Each independent fixture is inserted once without a prior durable revision.
 		}
+		// Commit the complete aggregate and projection before advancing to the next identity.
 		if err := store.Create(t.Context(), instance); err != nil {
 			t.Fatalf("Create(%q) error = %v", instanceID, err)
 		}
@@ -282,23 +320,278 @@ func TestProjectionTaskPaginationBreaksEqualTimesByIdentity(t *testing.T) {
 	projection := postgres.NewProjection(pool)
 	first, err := projection.Worklist(t.Context(), postgres.ActorQuery{
 		ActorID: "reviewer-a",
-		Page:    postgres.PageRequest{Limit: 1},
+		Page:    postgres.PageRequest{Limit: projectionMinimumLimit},
 	})
 	if err != nil {
 		t.Fatalf("first Worklist() error = %v", err)
 	}
-	if len(first.Items) != 1 || first.Items[0].InstanceID != "tie-a" || first.Next == nil {
+	// The first equal-time task must expose a continuation to the only later instance identity.
+	if len(first.Items) != projectionMinimumLimit || first.Items[0].InstanceID != "tie-a" || first.Next == nil {
 		t.Fatalf("first Worklist() page = %#v, want tie-a and cursor", first)
 	}
 	second, err := projection.Worklist(t.Context(), postgres.ActorQuery{
 		ActorID: "reviewer-a",
-		Page:    postgres.PageRequest{Limit: 1, After: first.Next},
+		Page:    postgres.PageRequest{Limit: projectionMinimumLimit, After: first.Next},
 	})
 	if err != nil {
 		t.Fatalf("second Worklist() error = %v", err)
 	}
-	if len(second.Items) != 1 || second.Items[0].InstanceID != "tie-b" || second.Next != nil {
+	// The second equal-time task is final and therefore must not expose another continuation.
+	if len(second.Items) != projectionMinimumLimit || second.Items[0].InstanceID != "tie-b" || second.Next != nil {
 		t.Fatalf("second Worklist() page = %#v, want final tie-b", second)
+	}
+
+	// The instance family uses the same timestamp and InstanceID ordering without accepting a TaskID component.
+	firstInstance, err := projection.Initiated(t.Context(), postgres.ActorQuery{
+		ActorID: "requester-a",
+		Page:    postgres.PageRequest{Limit: projectionMinimumLimit},
+	})
+	if err != nil {
+		t.Fatalf("first Initiated() error = %v", err)
+	}
+	// The first equal-time instance must expose a continuation to the only later identity.
+	if len(firstInstance.Items) != projectionMinimumLimit || firstInstance.Items[0].InstanceID != "tie-a" || firstInstance.Next == nil {
+		t.Fatalf("first Initiated() page = %#v, want tie-a and cursor", firstInstance)
+	}
+	secondInstance, err := projection.Initiated(t.Context(), postgres.ActorQuery{
+		ActorID: "requester-a",
+		Page:    postgres.PageRequest{Limit: projectionMinimumLimit, After: firstInstance.Next},
+	})
+	if err != nil {
+		t.Fatalf("second Initiated() error = %v", err)
+	}
+	// The second equal-time instance is the final identity and therefore must not expose continuation.
+	if len(secondInstance.Items) != projectionMinimumLimit || secondInstance.Items[0].InstanceID != "tie-b" || secondInstance.Next != nil {
+		t.Fatalf("second Initiated() page = %#v, want final tie-b", secondInstance)
+	}
+}
+
+// TestProjectionTaskPaginationBreaksEqualTimesByTaskIdentity verifies both task views page by their final tie-breaker.
+//
+// t owns one isolated PostgreSQL schema containing equal-time active and completed assignments. Each public task view
+// must return every expected TaskID once, preserve ascending identity order, and expose nil Next on its final item.
+func TestProjectionTaskPaginationBreaksEqualTimesByTaskIdentity(t *testing.T) {
+	dsn := requireIntegrationDSN(t)
+	pool := newProjectionPool(t, dsn)
+	store := postgres.New(pool)
+	equalTime := time.Date(2026, 7, 18, 13, 0, 0, 0, time.UTC) // One instance makes TaskID the only differing order key.
+	instance := &workflow.Instance{
+		ID: "task-tie-instance",
+		Definition: workflow.Definition{
+			ID:      "task-tie-definition",
+			Version: 1, // A concrete frozen version is required for projection decoding.
+		},
+		Status:        workflow.InstanceStatusRunning,
+		Initiator:     "requester-a",
+		CurrentNodeID: "review",
+		Tasks: []workflow.Task{
+			{ID: "active-a", NodeID: "review", Assignee: "reviewer-a", Status: workflow.TaskStatusActive},
+			{ID: "active-b", NodeID: "review", Assignee: "reviewer-a", Status: workflow.TaskStatusActive},
+			{ID: "active-c", NodeID: "review", Assignee: "reviewer-a", Status: workflow.TaskStatusActive},
+			{ID: "completed-a", NodeID: "review", Assignee: "reviewer-a", Status: workflow.TaskStatusCompleted},
+			{ID: "completed-b", NodeID: "review", Assignee: "reviewer-a", Status: workflow.TaskStatusCompleted},
+			{ID: "completed-c", NodeID: "review", Assignee: "reviewer-a", Status: workflow.TaskStatusCompleted},
+		},
+		Audit: []workflow.AuditRecord{{
+			Action:  "instance.started",
+			NodeID:  "start",
+			ActorID: "requester-a",
+			At:      equalTime,
+		}},
+		Version: 1, // The fixture is inserted once and has no previous durable revision.
+	}
+	// Persist every assignment in one command transaction so both query views observe the same snapshot.
+	if err := store.Create(t.Context(), instance); err != nil {
+		t.Fatalf("Create(task tie fixture) error = %v", err)
+	}
+
+	// The same paging loop exercises valid continuation cursors returned independently by each task family.
+	projection := postgres.NewProjection(pool)
+	families := []struct {
+		name string
+		want []workflow.TaskID
+		call func(*postgres.Cursor) (postgres.Page[postgres.TaskProjection], error)
+	}{
+		{
+			name: "worklist",
+			want: []workflow.TaskID{"active-a", "active-b", "active-c"},
+			call: func(after *postgres.Cursor) (postgres.Page[postgres.TaskProjection], error) {
+				return projection.Worklist(t.Context(), postgres.ActorQuery{
+					ActorID: "reviewer-a",
+					Page:    postgres.PageRequest{Limit: projectionMinimumLimit, After: after},
+				})
+			},
+		},
+		{
+			name: "participated",
+			want: []workflow.TaskID{"completed-a", "completed-b", "completed-c"},
+			call: func(after *postgres.Cursor) (postgres.Page[postgres.TaskProjection], error) {
+				return projection.Participated(t.Context(), postgres.ActorQuery{
+					ActorID: "reviewer-a",
+					Page:    postgres.PageRequest{Limit: projectionMinimumLimit, After: after},
+				})
+			},
+		},
+	}
+	for _, family := range families {
+		// This callback owns one family's cursor chain and must stop exactly on its final expected TaskID.
+		t.Run(family.name, func(t *testing.T) {
+			var after *postgres.Cursor
+			got := make([]workflow.TaskID, 0, len(family.want))
+			for len(got) < len(family.want) {
+				page, err := family.call(after)
+				if err != nil {
+					t.Fatalf("query error = %v", err)
+				}
+				if len(page.Items) != projectionMinimumLimit {
+					t.Fatalf("page items = %#v, want exactly one item", page.Items)
+				}
+				got = append(got, page.Items[0].TaskID)
+				if len(got) < len(family.want) {
+					if page.Next == nil {
+						t.Fatalf("page %d Next = nil before final item", len(got))
+					}
+					// Resume from the exact item just observed so the next assertion detects gaps or duplication.
+					after = page.Next
+					continue
+				}
+				if page.Next != nil {
+					t.Fatalf("final page Next = %#v, want nil", page.Next)
+				}
+			}
+			if !slices.Equal(got, family.want) {
+				t.Fatalf("task order = %v, want %v", got, family.want)
+			}
+		})
+	}
+}
+
+// TestProjectionQueryFamiliesApplyDocumentedLimits verifies default, minimum, and maximum sizes against real rows.
+//
+// t owns an isolated migrated schema and creates maximum-plus-one rows for every public query family. Each subtest
+// requires the documented count and a look-ahead cursor; PostgreSQL setup failures stop the test without shared state.
+func TestProjectionQueryFamiliesApplyDocumentedLimits(t *testing.T) {
+	dsn := requireIntegrationDSN(t)
+	pool := newProjectionPool(t, dsn)
+	store := postgres.New(pool)
+	orderAt := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC) // Equal ordering keys force identity tie-breakers on every page.
+
+	// One instance supplies enough active and completed assignments to exercise both task query views.
+	tasks := make([]workflow.Task, 0, projectionLimitFixtureCount*2) // Two task families each need maximum plus look-ahead.
+	for index := 0; index < projectionLimitFixtureCount; index++ {
+		tasks = append(tasks,
+			workflow.Task{
+				ID:       workflow.TaskID(fmt.Sprintf("limit-active-%03d", index)), // Fixed width preserves identity order through 200.
+				NodeID:   "review",
+				Assignee: "limit-reviewer",
+				Status:   workflow.TaskStatusActive,
+			},
+			workflow.Task{
+				ID:       workflow.TaskID(fmt.Sprintf("limit-completed-%03d", index)), // Separate prefix prevents task identity overlap.
+				NodeID:   "review",
+				Assignee: "limit-reviewer",
+				Status:   workflow.TaskStatusCompleted,
+			},
+		)
+	}
+	primary := &workflow.Instance{
+		ID: "limit-instance-000",
+		Definition: workflow.Definition{
+			ID:      "limit-definition",
+			Version: 1, // A concrete frozen version is required for lossless projection decoding.
+		},
+		Status:        workflow.InstanceStatusRunning,
+		Initiator:     "limit-requester",
+		CurrentNodeID: "review",
+		Tasks:         tasks,
+		Audit: []workflow.AuditRecord{{
+			Action:  "instance.started",
+			NodeID:  "start",
+			ActorID: "limit-requester",
+			At:      orderAt,
+		}},
+		Version: 1, // Store optimistic concurrency starts each independent fixture at version one.
+	}
+	// Persist the task-bearing instance first so every family has its maximum-plus-look-ahead fixture before querying.
+	if err := store.Create(t.Context(), primary); err != nil {
+		t.Fatalf("Create(primary limit fixture) error = %v", err)
+	}
+
+	// Additional taskless instances bring Initiated to maximum plus one without altering either task view.
+	for index := 1; index < projectionLimitFixtureCount; index++ {
+		instance := &workflow.Instance{
+			ID: workflow.InstanceID(fmt.Sprintf("limit-instance-%03d", index)), // Fixed width matches ascending keyset identity order.
+			Definition: workflow.Definition{
+				ID:      "limit-definition",
+				Version: 1, // Every fixture represents the same frozen definition revision.
+			},
+			Status:        workflow.InstanceStatusRunning,
+			Initiator:     "limit-requester",
+			CurrentNodeID: "review",
+			Audit: []workflow.AuditRecord{{
+				Action:  "instance.started",
+				NodeID:  "start",
+				ActorID: "limit-requester",
+				At:      orderAt,
+			}},
+			Version: 1, // Each instance is inserted once and has no prior durable revision.
+		}
+		if err := store.Create(t.Context(), instance); err != nil {
+			t.Fatalf("Create(limit fixture %d) error = %v", index, err)
+		}
+	}
+
+	// Exercise each public family with independent spec-derived expected counts and a required look-ahead cursor.
+	projection := postgres.NewProjection(pool)
+	families := []struct {
+		name string
+		call func(int) (int, bool, error)
+	}{
+		{name: "worklist", call: func(limit int) (int, bool, error) {
+			page, err := projection.Worklist(t.Context(), postgres.ActorQuery{
+				ActorID: "limit-reviewer",
+				Page:    postgres.PageRequest{Limit: limit},
+			})
+			return len(page.Items), page.Next != nil, err
+		}},
+		{name: "participated", call: func(limit int) (int, bool, error) {
+			page, err := projection.Participated(t.Context(), postgres.ActorQuery{
+				ActorID: "limit-reviewer",
+				Page:    postgres.PageRequest{Limit: limit},
+			})
+			return len(page.Items), page.Next != nil, err
+		}},
+		{name: "initiated", call: func(limit int) (int, bool, error) {
+			page, err := projection.Initiated(t.Context(), postgres.ActorQuery{
+				ActorID: "limit-requester",
+				Page:    postgres.PageRequest{Limit: limit},
+			})
+			return len(page.Items), page.Next != nil, err
+		}},
+	}
+	limits := []struct {
+		name    string
+		request int
+		want    int
+	}{
+		{name: "default", request: projectionOmittedLimit, want: projectionDefaultLimit},
+		{name: "minimum", request: projectionMinimumLimit, want: projectionMinimumLimit},
+		{name: "maximum", request: projectionMaximumLimit, want: projectionMaximumLimit},
+	}
+	for _, family := range families {
+		for _, limit := range limits {
+			// This callback checks one family and boundary against a fresh first page in the isolated schema.
+			t.Run(family.name+"/"+limit.name, func(t *testing.T) {
+				count, hasNext, err := family.call(limit.request)
+				if err != nil {
+					t.Fatalf("query error = %v", err)
+				}
+				// Every fixture set has one later row, so count and continuation must agree at each boundary.
+				if count != limit.want || !hasNext {
+					t.Fatalf("query count = %d, hasNext = %t, want %d and true", count, hasNext, limit.want)
+				}
+			})
+		}
 	}
 }
 
