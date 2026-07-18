@@ -52,11 +52,36 @@ type CommandInput struct {
 	Tasks  []Task
 }
 
+// PreparedActivationInput supplies immutable business data to one request-local prepared handler executor.
+//
+// Configuration is absent by design because NodeHandlerConfigPreparer already decoded and validated it when the
+// executable Definition plan was compiled. Data is a defensive copy and may be absent or contain one JSON value.
+type PreparedActivationInput struct {
+	// Data is the instance's opaque business JSON, detached from Store and compiled-plan ownership.
+	Data json.RawMessage
+}
+
+// PreparedCommandInput supplies runtime facts to one request-local prepared handler executor.
+//
+// Configuration is owned by the executor returned during Definition compilation. State and Tasks are defensive copies;
+// Tasks contains the current node's complete historical and active task view. Mutating inputs never changes Store state.
+type PreparedCommandInput struct {
+	Command
+
+	// Data is the instance's opaque business JSON, detached from Store ownership.
+	Data json.RawMessage
+	// State is the current node's optional opaque handler JSON, detached from Store ownership.
+	State json.RawMessage
+	// Tasks is the complete detached task view for the current node, including historical rounds after return.
+	Tasks []Task
+}
+
 // NodeResult is the only channel through which a handler proposes runtime changes.
 //
-// Waiting results must contain the node's complete task view. Continue results require one declared edge
-// selected by Outcome. Reject results terminate with an empty outcome or require a matching declared edge
-// for a non-empty outcome. State is opaque JSON persisted for the active node.
+// Waiting results cannot name an Outcome. Activation supplies new active task drafts, command handling supplies the
+// current node's complete task view, and return activation must supply a non-empty fresh task round. Continue results
+// require one declared edge selected by Outcome. Reject results terminate with an empty outcome or require a matching
+// declared edge for a non-empty outcome. State is absent or valid opaque JSON persisted for the active node.
 type NodeResult struct {
 	Disposition Disposition
 	Outcome     string
@@ -73,6 +98,28 @@ type NodeHandler interface {
 	Validate(config json.RawMessage) error
 	Activate(ctx context.Context, input ActivationInput) (NodeResult, error)
 	Handle(ctx context.Context, input CommandInput) (NodeResult, error)
+}
+
+// PreparedNodeHandler executes one handler-owned configuration prepared for a single compiled Definition plan.
+//
+// Implementations receive no raw config and should retain only immutable decoded data plus long-lived dependencies from
+// the registered NodeHandler. Engine never serializes or persists this value and discards it after one CompileDefinition
+// validation or Engine operation. Methods run sequentially within that plan; shared collaborators retain their own
+// concurrency obligations. Blocking work must honor ctx cancellation.
+type PreparedNodeHandler interface {
+	ActivatePrepared(ctx context.Context, input PreparedActivationInput) (NodeResult, error)
+	HandlePrepared(ctx context.Context, input PreparedCommandInput) (NodeResult, error)
+}
+
+// NodeHandlerConfigPreparer optionally replaces repeated raw-config parsing with request-local preparation.
+//
+// PrepareConfig receives a defensive canonical JSON copy exactly once per node during each complete Definition
+// compilation. It must perform the validation otherwise provided by NodeHandler.Validate and return a non-nil immutable
+// executor. Errors are classified as ErrInvalidNodeConfig by the compiler. Existing NodeHandler implementations need not
+// implement this interface; the compiler validates them normally and creates a compatibility executor that supplies raw
+// config. Prepared executors are never cached across Engine operations or persisted in Definition snapshots.
+type NodeHandlerConfigPreparer interface {
+	PrepareConfig(config json.RawMessage) (PreparedNodeHandler, error)
 }
 
 // Registry maps stable node-kind names to explicitly registered handlers.

@@ -145,7 +145,7 @@ func (e *Engine) Handle(ctx context.Context, command Command) (*Instance, error)
 	// Prepare handler output from a detached snapshot, then let the shared command skeleton commit it once.
 	var plan *compiledDefinition
 	var node *NodeDefinition
-	var result NodeResult
+	var application *nodeResultApplication
 	return e.executeInstanceCommand(ctx, instanceCommand{
 		name:            "task command",
 		instanceID:      command.InstanceID,
@@ -160,27 +160,35 @@ func (e *Engine) Handle(ctx context.Context, command Command) (*Instance, error)
 			if err != nil {
 				return err
 			}
-			handler, err := e.registry.handler(node.Kind)
+			handler, err := plan.preparedHandler(node.ID)
 			if err != nil {
 				return err
 			}
-			result, err = handler.Handle(ctx, CommandInput{
-				Config:  slices.Clone(node.Config),
+			result, err := handler.HandlePrepared(ctx, PreparedCommandInput{
+				Command: command,
 				Data:    slices.Clone(snapshot.Data),
 				State:   slices.Clone(snapshot.NodeState),
 				Tasks:   nodeTasks(snapshot.Tasks, node.ID),
-				Command: command,
 			})
 			if err != nil {
 				return fmt.Errorf("workflow: handle node %q command: %w", node.ID, err)
 			}
-			return nil
+			application, err = prepareCommandNodeResult(snapshot, node.ID, result)
+			return err
 		},
 		audit: func(facts *instanceFacts) {
 			facts.recordTaskCommand(command.Name, node.ID, command.TaskID, command.ActorID)
 		},
 		transition: func(facts *instanceFacts) error {
-			return e.applyResult(ctx, facts, plan, node, result)
+			decision, err := application.apply(facts)
+			if err != nil {
+				return err
+			}
+			outcome, advance, err := decision.navigation()
+			if err != nil || !advance {
+				return err
+			}
+			return e.advance(ctx, facts, plan, outcome)
 		},
 	})
 }
@@ -249,21 +257,22 @@ func (e *Engine) Return(
 
 	// Prepare the exact historical target and task drafts before the shared skeleton mutates the loaded aggregate.
 	var target *NodeDefinition
-	var result NodeResult
+	var application *nodeResultApplication
 	return e.executeInstanceCommand(ctx, instanceCommand{
 		name:            "return",
 		instanceID:      request.InstanceID,
 		nonRunningError: ErrInstanceNotRunning,
 		prepare: func(snapshot *Instance) error {
 			var err error
-			target, result, err = e.prepareReturn(ctx, request, policy, snapshot)
+			target, application, err = e.prepareReturn(ctx, request, policy, snapshot)
 			return err
 		},
 		audit: func(facts *instanceFacts) {
 			facts.recordReturn(target.ID, request.ActorID, request.Reason)
 		},
 		transition: func(facts *instanceFacts) error {
-			return facts.returnTo(target.ID, result)
+			_, err := application.apply(facts)
+			return err
 		},
 	})
 }
@@ -352,56 +361,52 @@ func prepareTransfer(
 //
 // request has passed boundary validation and snapshot is a detached running aggregate. The method compiles only
 // snapshot.Definition, rejects control, current, absent, and unvisited targets, then invokes policy with another
-// defensive snapshot so policy mutation cannot affect activation. Success returns the compiled target and a
-// waiting non-empty task result; errors leave the command candidate untouched and preserve stable sentinels.
+// defensive snapshot so policy mutation cannot affect activation. Success returns the compiled target and a fully
+// prepared result application; errors leave the command candidate untouched and preserve stable sentinels.
 func (e *Engine) prepareReturn(
 	ctx context.Context,
 	request ReturnRequest,
 	policy ReturnPolicy,
 	snapshot *Instance,
-) (*NodeDefinition, NodeResult, error) {
+) (*NodeDefinition, *nodeResultApplication, error) {
 	// Resolve the exact requested ID from the frozen plan rather than Definition slice position.
 	plan, err := compileDefinition(&snapshot.Definition, e.registry)
 	if err != nil {
-		return nil, NodeResult{}, err
+		return nil, nil, err
 	}
 	target, err := plan.node(request.TargetNodeID)
 	if err != nil {
-		return nil, NodeResult{}, fmt.Errorf("%w: %w", ErrInvalidReturnTarget, err)
+		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidReturnTarget, err)
 	}
 	// Control, current, and unvisited nodes cannot represent an earlier executable task round.
 	if target.Kind == KindStart || target.Kind == KindEnd || target.ID == snapshot.CurrentNodeID ||
 		!hasEnteredNode(snapshot.Audit, target.ID) {
-		return nil, NodeResult{}, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"%w: node %q is not an eligible historical target",
 			ErrInvalidReturnTarget,
 			target.ID,
 		)
 	}
 	if err := policy.AuthorizeReturn(ctx, request, cloneInstance(snapshot)); err != nil {
-		return nil, NodeResult{}, fmt.Errorf("workflow: authorize return: %w", err)
+		return nil, nil, fmt.Errorf("workflow: authorize return: %w", err)
 	}
 
 	// Eligible return nodes must activate a concrete waiting task round before any aggregate mutation.
-	handler, err := e.registry.handler(target.Kind)
+	handler, err := plan.preparedHandler(target.ID)
 	if err != nil {
-		return nil, NodeResult{}, err
+		return nil, nil, err
 	}
-	result, err := handler.Activate(ctx, ActivationInput{
-		Config: slices.Clone(target.Config),
-		Data:   slices.Clone(snapshot.Data),
+	result, err := handler.ActivatePrepared(ctx, PreparedActivationInput{
+		Data: slices.Clone(snapshot.Data),
 	})
 	if err != nil {
-		return nil, NodeResult{}, fmt.Errorf("workflow: reactivate return target %q: %w", target.ID, err)
+		return nil, nil, fmt.Errorf("workflow: reactivate return target %q: %w", target.ID, err)
 	}
-	if result.Disposition != DispositionWaiting || len(result.Tasks) == 0 {
-		return nil, NodeResult{}, fmt.Errorf(
-			"%w: node %q did not create a waiting task round",
-			ErrInvalidReturnTarget,
-			target.ID,
-		)
+	application, err := prepareReturnNodeResult(target.ID, result)
+	if err != nil {
+		return nil, nil, err
 	}
-	return target, result, nil
+	return target, application, nil
 }
 
 // executeInstanceCommand applies the invariant command sequence around one operation-specific transition.
@@ -503,81 +508,31 @@ func (e *Engine) advance(ctx context.Context, facts *instanceFacts, plan *compil
 			facts.complete()
 			return nil
 		}
-		handler, err := e.registry.handler(next.Kind)
+		handler, err := plan.preparedHandler(next.ID)
 		if err != nil {
 			return err
 		}
-		result, err := handler.Activate(ctx, ActivationInput{
-			Config: slices.Clone(next.Config),
-			Data:   slices.Clone(facts.candidate().Data),
+		result, err := handler.ActivatePrepared(ctx, PreparedActivationInput{
+			Data: slices.Clone(facts.candidate().Data),
 		})
 		if err != nil {
 			return fmt.Errorf("workflow: activate node %q: %w", next.ID, err)
 		}
-		if err := facts.activateTasks(next.ID, result.Tasks); err != nil {
+		application, err := prepareActivationNodeResult(next.ID, result)
+		if err != nil {
 			return err
 		}
-		facts.setNodeState(result.State)
-		switch result.Disposition {
-		case DispositionWaiting:
-			return nil
-		case DispositionContinue:
-			outcome = result.Outcome
-		case DispositionReject:
-			// Synchronous handlers use the same explicit outcome contract as command-driven handlers.
-			if result.Outcome != "" {
-				facts.rejectNode()
-				outcome = result.Outcome
-				continue
-			}
-
-			// Empty rejection outcomes retain the global terminal behavior.
-			facts.rejectInstance()
-			return nil
-		case DispositionUnknown:
-			return fmt.Errorf("%w: node %q returned an empty disposition", ErrInvalidNodeResult, next.ID)
-		default:
-			return fmt.Errorf("%w: node %q returned disposition %q", ErrInvalidNodeResult, next.ID, result.Disposition)
+		decision, err := application.apply(facts)
+		if err != nil {
+			return err
 		}
-	}
-}
-
-// applyResult validates one handler result and delegates its accepted facts to the caller-owned candidate.
-//
-// plan and node must belong to facts.candidate().Definition. Waiting replaces current tasks, continue requires the
-// result outcome route, and reject either terminates with an empty outcome or requires its outcome route.
-// Errors prevent the enclosing Handle operation from saving the mutated snapshot; this method performs no
-// Store I/O itself.
-func (e *Engine) applyResult(
-	ctx context.Context,
-	facts *instanceFacts,
-	plan *compiledDefinition,
-	node *NodeDefinition,
-	result NodeResult,
-) error {
-	if err := facts.replaceNodeTasks(node.ID, result.Tasks); err != nil {
-		return err
-	}
-	facts.setNodeState(result.State)
-	switch result.Disposition {
-	case DispositionWaiting:
-		return nil
-	case DispositionContinue:
-		return e.advance(ctx, facts, plan, result.Outcome)
-	case DispositionReject:
-		// A handler may name only an outcome; the compiled Definition remains the sole owner of its target node.
-		if result.Outcome != "" {
-			// Record rejection before target entry; callers discard both mutations when route resolution fails.
-			facts.rejectNode()
-			return e.advance(ctx, facts, plan, result.Outcome)
+		nextOutcome, shouldAdvance, err := decision.navigation()
+		if err != nil {
+			return err
 		}
-
-		// An empty outcome preserves the original terminal rejection contract.
-		facts.rejectInstance()
-		return nil
-	case DispositionUnknown:
-		return fmt.Errorf("%w: node %q returned an empty disposition", ErrInvalidNodeResult, node.ID)
-	default:
-		return fmt.Errorf("%w: node %q returned disposition %q", ErrInvalidNodeResult, node.ID, result.Disposition)
+		if !shouldAdvance {
+			return nil
+		}
+		outcome = nextOutcome
 	}
 }

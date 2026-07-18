@@ -3,6 +3,7 @@
 - 状态：Ready for agent
 - 类型：PostgreSQL adapter 内部架构深化
 - 兼容性目标：保持 Worklist、Participated、Initiated、Cursor、Scope 和分页行为兼容
+- 后续深化：opaque continuation 与 Cursor 弃用路径已由 [Projection continuation 决策](docs/architecture/postgres-projection-continuations.md) 接续；本 PRD 中将其列为 out of scope 仅描述当时交付边界。
 
 ## Problem Statement
 
@@ -119,4 +120,3 @@ Projection 继续是唯一公开查询入口，并继续借用调用方提供的
 - Worklist and Participated already demonstrate a real shared Task query family; the refactor should deepen that implementation rather than add another wrapper.
 - PostgreSQL remains the only Projection adapter. Following the one-adapter rule, no new production seam is introduced solely for tests.
 - The repository has no configured external issue tracker, domain glossary or ADR directory. This PRD is stored locally with `Ready for agent` status.
-

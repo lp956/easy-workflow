@@ -10,6 +10,12 @@
 // extension contract: implementations validate configuration and return declarative runtime results without
 // controlling persistence or graph navigation. Both contracts require concurrency safety and context propagation;
 // stable package errors are designed for errors.Is classification.
+// NodeHandlerConfigPreparer is an optional compatible extension: complete Definition compilation can decode one
+// node config into a request-local PreparedNodeHandler reused by that executable plan. Prepared executors, handlers,
+// callbacks, and indexes are never serialized, persisted, or cached across Engine operations. Handlers that implement
+// only NodeHandler retain raw-config validation and execution behavior through an internal compatibility executor.
+// Every activation, command, and return NodeResult is fully validated before package-internal instanceFacts applies
+// task, state, disposition, rejection, and lifecycle facts to the private atomic candidate.
 //
 // DefinitionPublisher is the shared publication boundary for Builder and JSON definitions. It compiles before
 // persistence, delegates atomic monotonically increasing version allocation to DefinitionVersionWriter, and leaves

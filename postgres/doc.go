@@ -13,4 +13,7 @@
 // PostgreSQL integration tests run only when EASY_WORKFLOW_POSTGRES_DSN is explicitly set. They create isolated
 // schemas and exercise the shared Store contract, rollback, concurrent CAS, pool restart, snapshot fidelity, and
 // projections; the package never starts a test database or falls back to an implicit local connection.
+// Projection's preferred WorklistPage, ParticipatedPage, and InitiatedPage methods expose versioned opaque
+// continuations while applying a fresh caller-supplied actor and authorization scope on every page. Deprecated Cursor
+// methods remain compatible through the current major version and delegate to the same Task or Instance query family.
 package postgres

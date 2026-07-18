@@ -42,7 +42,45 @@ type QueryScope struct {
 	InstanceIDs []workflow.InstanceID
 }
 
+// Continuation is an opaque, versioned position returned by one Projection query family.
+//
+// Callers may serialize the string but must not inspect, construct, or modify its contents. An empty value requests the
+// first page and marks the final page. WorklistPage and ParticipatedPage share task-family continuations; InitiatedPage
+// uses an instance-family continuation. Malformed or cross-family values return ErrInvalidProjectionQuery.
+type Continuation string
+
+// ContinuationPageRequest selects a bounded page after an optional opaque continuation.
+type ContinuationPageRequest struct {
+	// Limit is the requested item count in [1, 200]; zero selects the documented default of 50.
+	Limit int
+	// After resumes strictly after an unchanged token returned by the same compatible query family.
+	After Continuation
+}
+
+// ContinuationQuery selects one trusted actor, host-authorized scope, and opaque stable page.
+type ContinuationQuery struct {
+	// ActorID is the authenticated business principal whose assignments or initiations are requested.
+	ActorID workflow.ActorID
+	// Scope contains the host's tenant or business authorization result; Projection never broadens it.
+	Scope QueryScope
+	// Page bounds the result and optionally resumes an earlier page without exposing ordering keys.
+	Page ContinuationPageRequest
+}
+
+// ContinuationPage contains detached query results and an opaque token for the following page.
+//
+// Items is non-nil on success. Next is empty exactly when no later row was observed in the same database query. A
+// non-empty value must be returned unchanged through ContinuationPageRequest.After.
+type ContinuationPage[T any] struct {
+	// Items contains at most the normalized requested limit in stable query-family order.
+	Items []T
+	// Next resumes after the final returned item and is empty on the final page.
+	Next Continuation
+}
+
 // PageRequest selects a bounded page after an optional keyset cursor.
+//
+// Deprecated: use ContinuationPageRequest so callers do not construct or understand keyset components.
 type PageRequest struct {
 	// Limit is the requested item count in [1, 200]; zero selects the documented default of 50.
 	Limit int
@@ -55,6 +93,9 @@ type PageRequest struct {
 // Callers must treat fields as opaque continuation data and return them unchanged. TaskID is required for task
 // projections and may continue either task view; instance projections leave it empty. Structurally invalid cursors
 // or task cursors supplied to an instance query return ErrInvalidProjectionQuery.
+//
+// Deprecated: use Continuation returned by WorklistPage, ParticipatedPage, or InitiatedPage. Cursor remains available
+// through the current major version and legacy query methods preserve its existing field and ordering behavior.
 type Cursor struct {
 	// At is the row's normalized last-audit timestamp used as the primary descending sort key.
 	At time.Time
@@ -65,6 +106,8 @@ type Cursor struct {
 }
 
 // ActorQuery selects one trusted actor, host-authorized instance scope, and stable page.
+//
+// Deprecated: use ContinuationQuery with the opaque-token query methods.
 type ActorQuery struct {
 	// ActorID is the authenticated business principal whose assignments or initiations are requested.
 	ActorID workflow.ActorID
@@ -77,6 +120,8 @@ type ActorQuery struct {
 // Page contains one result slice and an optional cursor for the following page.
 //
 // Items is non-nil on success. Next is nil exactly when no later row was observed in the same database query.
+//
+// Deprecated: use ContinuationPage with the opaque-token query methods.
 type Page[T any] struct {
 	// Items contains at most the normalized requested limit in stable query order.
 	Items []T

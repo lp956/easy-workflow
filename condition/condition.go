@@ -128,7 +128,18 @@ type Expression struct {
 // It is safe for concurrent use because every call decodes into fresh local values.
 type Handler struct{}
 
-var _ workflow.NodeHandler = (*Handler)(nil)
+// preparedHandler owns one validated immutable Condition config for a request-local compiled Definition plan.
+// It performs no I/O, cross-request caching, serialization, or persistence.
+type preparedHandler struct {
+	// config is the decoded restricted rule set reused by prepared activation.
+	config Config
+}
+
+var (
+	_ workflow.NodeHandler               = (*Handler)(nil)
+	_ workflow.NodeHandlerConfigPreparer = (*Handler)(nil)
+	_ workflow.PreparedNodeHandler       = (*preparedHandler)(nil)
+)
 
 // NewHandler creates the stateless official condition handler.
 func NewHandler() *Handler {
@@ -144,6 +155,19 @@ func (h *Handler) Validate(config json.RawMessage) error {
 	return err
 }
 
+// PrepareConfig decodes and validates one canonical Condition config for a request-local executable plan.
+//
+// config follows Validate's restricted schema and is not retained as raw bytes. The returned immutable executor reuses
+// the decoded rules for activation, performs no I/O, and is never cached across Engine operations. Errors preserve
+// ErrInvalidConfig and its detailed cause.
+func (h *Handler) PrepareConfig(config json.RawMessage) (workflow.PreparedNodeHandler, error) {
+	prepared, err := parseConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	return &preparedHandler{config: prepared}, nil
+}
+
 // Activate evaluates validated rules against the supplied defensive business-data snapshot.
 //
 // input.Config must satisfy Validate and input.Data must be a JSON object. The method returns Continue with
@@ -157,13 +181,35 @@ func (h *Handler) Activate(ctx context.Context, input workflow.ActivationInput) 
 	if err != nil {
 		return workflow.NodeResult{}, err
 	}
+	return activateConfig(config, input.Data)
+}
+
+// ActivatePrepared evaluates business data with rules decoded during executable-plan compilation.
+//
+// input.Data must be a JSON object and is decoded into request-local storage. The method reuses immutable Config, performs
+// no external I/O, retains no input, and returns cancellation or Condition evaluation errors without fallback.
+func (h *preparedHandler) ActivatePrepared(
+	ctx context.Context,
+	input workflow.PreparedActivationInput,
+) (workflow.NodeResult, error) {
+	if err := ctx.Err(); err != nil {
+		return workflow.NodeResult{}, fmt.Errorf("condition: activate: %w", err)
+	}
+	return activateConfig(h.config, input.Data)
+}
+
+// activateConfig evaluates every validated rule against one detached business-data JSON object.
+//
+// config must come from parseConfig and data must encode a non-nil object. Exactly one match returns Continue; no match
+// uses DefaultOutcome or ErrNoMatch, and overlaps return ErrMultipleMatches. The function retains no input and performs no I/O.
+func activateConfig(config Config, dataJSON json.RawMessage) (workflow.NodeResult, error) {
 
 	// Decode business data into fresh storage so evaluation cannot mutate or retain Engine-owned bytes.
 	var data map[string]any
-	if err := rejectDuplicateObjectKeys(input.Data); err != nil {
+	if err := rejectDuplicateObjectKeys(dataJSON); err != nil {
 		return workflow.NodeResult{}, fmt.Errorf("%w: %w", ErrInvalidData, err)
 	}
-	if err := decodeJSON(input.Data, &data); err != nil {
+	if err := decodeJSON(dataJSON, &data); err != nil {
 		return workflow.NodeResult{}, fmt.Errorf("%w: JSON object required: %w", ErrInvalidData, err)
 	}
 	if data == nil {
@@ -199,6 +245,20 @@ func (h *Handler) Activate(ctx context.Context, input workflow.ActivationInput) 
 // The method ignores input data, creates no state, and always returns workflow.ErrInvalidCommand. Context
 // cancellation is reported first so callers can consistently abandon work.
 func (h *Handler) Handle(ctx context.Context, _ workflow.CommandInput) (workflow.NodeResult, error) {
+	if err := ctx.Err(); err != nil {
+		return workflow.NodeResult{}, fmt.Errorf("condition: handle: %w", err)
+	}
+	return workflow.NodeResult{}, fmt.Errorf("%w: condition nodes do not accept commands", workflow.ErrInvalidCommand)
+}
+
+// HandlePrepared rejects commands because a prepared Condition still completes synchronously during activation.
+//
+// The method ignores input, creates no state, performs no I/O, and returns workflow.ErrInvalidCommand. Context
+// cancellation is reported first so callers can abandon work consistently with the legacy Handle path.
+func (h *preparedHandler) HandlePrepared(
+	ctx context.Context,
+	_ workflow.PreparedCommandInput,
+) (workflow.NodeResult, error) {
 	if err := ctx.Err(); err != nil {
 		return workflow.NodeResult{}, fmt.Errorf("condition: handle: %w", err)
 	}

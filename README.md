@@ -104,7 +104,7 @@ go test . -run '^Example$' -count=1
 
 ## Definition 发布与版本
 
-Builder 和 Web JSON 汇入同一个 canonical `workflow.Definition`，并由同一个 `DefinitionPublisher` 完成编译、handler config 校验和版本分配：
+Builder 和 Web JSON 汇入同一个 canonical `workflow.Definition`，并由同一个 `DefinitionPublisher` 完成编译、handler config 校验/请求内准备和版本分配：
 
 1. `publisher.Publish(ctx, builderDefinition)` 发布代码定义并取得版本 1。
 2. `publisher.PublishJSON(ctx, definitionJSON)` 解析相同 ID 的 JSON，通过同一发布路径取得版本 2。
@@ -157,36 +157,36 @@ go test ./condition -run '^ExampleHandler_webJSON$' -count=1
 
 | 方法 | 返回值 | 语义 |
 | --- | --- | --- |
-| `Worklist` | `Page[TaskProjection]` | actor 在运行中 Instance 里的 active 冻结任务 |
-| `Participated` | `Page[TaskProjection]` | actor 已 completed 或 closed 的冻结任务 |
-| `Initiated` | `Page[InstanceProjection]` | actor 发起的运行中及终态 Instance |
+| `WorklistPage` | `ContinuationPage[TaskProjection]` | actor 在运行中 Instance 里的 active 冻结任务 |
+| `ParticipatedPage` | `ContinuationPage[TaskProjection]` | actor 已 completed 或 closed 的冻结任务 |
+| `InitiatedPage` | `ContinuationPage[InstanceProjection]` | actor 发起的运行中及终态 Instance |
 
 ```go
 projection := postgres.NewProjection(pool)
 const pageLimit = 50 // 使用公开契约的默认页大小，并在连续请求间保持不变。
 
 // 首次查询应用宿主计算的完整授权 scope；Projection 不会补充或放宽它。
-page, err := projection.Worklist(ctx, postgres.ActorQuery{
+page, err := projection.WorklistPage(ctx, postgres.ContinuationQuery{
 	ActorID: actorID,
 	Scope: postgres.QueryScope{
 		InstanceIDs: authorizedInstanceIDs,
 	},
-	Page: postgres.PageRequest{Limit: pageLimit},
+	Page: postgres.ContinuationPageRequest{Limit: pageLimit},
 })
 if err != nil {
 	// 验证、取消或数据库错误都不会产生可继续使用的部分页面。
 	return err
 }
 
-// page.Next 非 nil 时，把它原样传回同一个 Task 查询族以读取下一页。
-if page.Next != nil {
-	// 连续请求保持 actor、scope 和 limit 不变，只替换服务端返回的 cursor。
-	nextPage, err := projection.Worklist(ctx, postgres.ActorQuery{
+// page.Next 非空时，把 opaque token 原样传回同一个 Task 查询族以读取下一页。
+if page.Next != "" {
+	// 连续请求保持 actor、scope 和 limit 不变，只替换 Projection 返回的 continuation。
+	nextPage, err := projection.WorklistPage(ctx, postgres.ContinuationQuery{
 		ActorID: actorID,
 		Scope: postgres.QueryScope{
 			InstanceIDs: authorizedInstanceIDs,
 		},
-		Page: postgres.PageRequest{Limit: pageLimit, After: page.Next},
+		Page: postgres.ContinuationPageRequest{Limit: pageLimit, After: page.Next},
 	})
 	if err != nil {
 		// 下一页失败时保留原页，调用方可按错误原因决定是否重试。
@@ -199,12 +199,13 @@ if page.Next != nil {
 查询输入遵守以下兼容契约：
 
 - `QueryScope.InstanceIDs == nil` 表示不附加 Instance 限制；非 nil 空 slice 表示拒绝全部 Instance，并直接返回非 nil 空 `Items`；非空 slice 只允许列出的 Instance。
-- `PageRequest.Limit == 0` 使用默认值 50；显式值必须位于 `[1, 200]`，否则返回可由 `errors.Is` 识别的 `postgres.ErrInvalidProjectionQuery`。
-- Task 查询按审计时间降序、InstanceID 和 TaskID 升序稳定分页；Worklist 与 Participated 共享 Task cursor 形状。Initiated 使用不含 TaskID 的 Instance cursor，跨家族或字段不完整的 cursor 会被拒绝。
-- `Next` 只在同一查询快照中观察到后续行时返回，末页为 nil；成功时 `Items` 始终非 nil。
-- actor、scope、cursor 和 limit 全部作为 PostgreSQL 参数传递，不参与 SQL 文本拼接。
+- `ContinuationPageRequest.Limit == 0` 使用默认值 50；显式值必须位于 `[1, 200]`，否则返回可由 `errors.Is` 识别的 `postgres.ErrInvalidProjectionQuery`。
+- Task 查询按审计时间降序、InstanceID 和 TaskID 升序稳定分页；`WorklistPage` 与 `ParticipatedPage` 共享 opaque Task continuation。`InitiatedPage` 使用 Instance continuation，跨家族或结构无效的 token 会在数据库访问前被拒绝。token 不是签名或授权凭据，scope 仍由每次查询显式提供。
+- `Next` 只在同一查询快照中观察到后续行时返回，末页为空字符串；成功时 `Items` 始终非 nil。token 不携带授权，后续请求必须重新提供可信 actor 与完整 scope。
+- actor、scope、continuation 解出的 keyset 和 limit 全部作为 PostgreSQL 参数传递，不参与 SQL 文本拼接。
+- 旧 `Worklist`、`Participated`、`Initiated`、`ActorQuery`、`PageRequest`、`Cursor` 与 `Page` 已标记 Deprecated，并在当前 major version 内保持原分页行为；迁移只需改用对应 `*Page` 方法并把 `Next` 从 nil 判断改为空字符串判断。
 
-内部实现按 Task 与 Instance 两个查询族分别收拢输入规范化、keyset 参数、扫描和分页构造，只共享 limit、取消和 scope 值转换等完全一致的边界行为；新增查询族不需要引入通用 repository 或 mock-only executor。
+内部实现按 Task 与 Instance 两个查询族分别拥有 continuation 映射与校验、keyset 参数、扫描和分页构造，只共享版本化 base64url 传输编码以及 limit、取消和 scope 值转换等完全一致的边界行为；新增查询族不需要引入通用 repository 或 mock-only executor。
 
 集成测试要求调用方显式提供测试数据库，不会启动容器或使用隐式本机默认值：
 
@@ -212,25 +213,27 @@ if page.Next != nil {
 EASY_WORKFLOW_POSTGRES_DSN='postgres://user:password@localhost:5432/easy_workflow_test?sslmode=disable' go test ./postgres -count=1
 ```
 
-测试会为各场景创建隔离 schema，并覆盖公共 Store 契约、事务回滚、并发 CAS、pool 重启后的读取、完整快照恢复，以及 Projection 的 scope、稳定排序、cursor、分页边界和事务可见性。未设置 `EASY_WORKFLOW_POSTGRES_DSN` 时，数据库相关用例会明确 skip。
+测试会为各场景创建随机隔离 schema，并覆盖公共 Store 契约、事务回滚、并发 CAS、pool 重启后的读取、完整快照恢复，以及 Projection 的 scope、稳定排序、opaque continuation、旧 Cursor 兼容、分页边界和事务可见性。未设置 `EASY_WORKFLOW_POSTGRES_DSN` 时，数据库相关用例会明确 skip。
 
 ## 公开契约
 
 - `Store`：`Create` 仅插入，`Load` 返回调用方拥有的深拷贝，`Save` 以 `expectedVersion` 原子 CAS 完整聚合；Audit 只能追加。实现必须支持并发调用、传播 context cancellation，并通过 `errors.Is` 暴露稳定 sentinel。
-- `NodeHandler`：`Validate` 在启动或发布前校验配置；`Activate` 和 `Handle` 只返回声明式 `NodeResult`，不能直接访问 Store 或任意跳转。handler 必须能被不同 Instance 并发调用，阻塞工作必须遵守 context cancellation。
+- `NodeHandler`：`Validate` 在启动或发布前校验配置；`Activate` 和 `Handle` 只返回声明式 `NodeResult`，不能直接访问 Store 或任意跳转。handler 必须能被不同 Instance 并发调用，阻塞工作必须遵守 context cancellation。需要避免重复解析配置的实现可额外实现 `NodeHandlerConfigPreparer`；编译器每个节点、每次 executable plan 只调用一次 `PrepareConfig`，返回值只在该请求内复用且永不持久化。旧 handler 无需修改。
 - Definition 发布：发布前完整编译；失败不占版本、不留部分记录。writer 为同一 ID 原子分配严格递增版本并保存防御性快照；reader 的 `Load` 只读指定版本且不 fallback，`LoadLatest` 读取当前最大版本。发布与读取必须支持并发。
 
 `DefinitionVersionWriter` 与 `DefinitionReader` 是刻意分离的 capability seam：`DefinitionPublisher` 只依赖写入，`Engine.StartPublished` 只依赖调用方提供的精确版本读取。`MemoryDefinitionStore` 是当前参考 adapter，而不是唯一允许的实现。新 adapter 必须原样运行 `definitiontest.RunWriter`、`definitiontest.RunReader` 和 `definitiontest.RunRepository`；Definition repository 不并入 command-side `Store`。
 
-保留条件、未来变更证据和 durable adapter 边界记录在 [Definition repository seam 架构决策](docs/architecture/definition-repository-seams.md)。
+Definition repository 的能力边界记录在 [Definition repository seam 架构决策](docs/architecture/definition-repository-seams.md)；NodeResult application、request-local handler preparation 与 Projection continuation 的 source of truth 和兼容决策记录在 [Runtime deep modules 架构决策](docs/architecture/runtime-deep-modules.md) 与 [Projection continuation 架构决策](docs/architecture/postgres-projection-continuations.md)。
 
 这些契约的完整错误语义以相应公开类型的 Go package documentation 为准：
 
 ```bash
 go doc github.com/lvpeng/easy-workflow.Store
 go doc github.com/lvpeng/easy-workflow.NodeHandler
+go doc github.com/lvpeng/easy-workflow.NodeHandlerConfigPreparer
 go doc github.com/lvpeng/easy-workflow.DefinitionPublisher
 go doc github.com/lvpeng/easy-workflow/definitiontest
+go doc github.com/lvpeng/easy-workflow/postgres.Continuation
 ```
 
 ## 发布验证

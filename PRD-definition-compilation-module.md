@@ -3,6 +3,7 @@
 - 状态：Ready for agent
 - 类型：内部架构深化
 - 兼容性目标：保持 canonical Definition JSON、公开编译行为和 Engine 行为兼容
+- 后续深化：request-local handler config preparation 已由 [Runtime deep modules 决策](docs/architecture/runtime-deep-modules.md) 接续；本 PRD 中将其列为 out of scope 仅描述当时交付边界。
 
 ## Problem Statement
 
@@ -117,4 +118,3 @@
 - The repository has no configured external issue tracker, domain glossary or ADR directory. This PRD is stored locally with `Ready for agent` status.
 - The original unified compiler requirement remains authoritative: Builder and JSON share canonical data, and Engine consumes deterministic execution semantics.
 - Handler config parsing across Validate, Activate and Handle may still warrant a separate future PRD; it is intentionally excluded here to preserve NodeHandler compatibility.
-
