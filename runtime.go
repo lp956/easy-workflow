@@ -66,11 +66,17 @@ type Task struct {
 // within Instance and remains authoritative if timestamps are equal.
 type AuditRecord struct {
 	Action string `json:"action"`
-	NodeID string `json:"nodeId,omitempty"`
+	// InstanceID identifies the aggregate explicitly when an audit fact may be consumed outside its owning snapshot.
+	InstanceID InstanceID `json:"instanceId,omitempty"`
+	NodeID     string     `json:"nodeId,omitempty"`
 	// TargetNodeID identifies the explicit destination of a lifecycle transition when one exists.
 	TargetNodeID string  `json:"targetNodeId,omitempty"`
 	TaskID       TaskID  `json:"taskId,omitempty"`
 	ActorID      ActorID `json:"actorId,omitempty"`
+	// PreviousAssignee identifies the assignment owner before a task transfer.
+	PreviousAssignee ActorID `json:"previousAssignee,omitempty"`
+	// NewAssignee identifies the assignment owner selected by a task transfer.
+	NewAssignee ActorID `json:"newAssignee,omitempty"`
 	// Reason preserves the host-provided lifecycle justification verbatim.
 	Reason string `json:"reason,omitempty"`
 	// NodeState preserves opaque source-node bytes as a string before a lifecycle transition replaces current state.
@@ -150,6 +156,34 @@ type ReturnRequest struct {
 type ReturnPolicy interface {
 	// AuthorizeReturn returns nil only when the actor may perform this exact source-target return.
 	AuthorizeReturn(ctx context.Context, request ReturnRequest, instance *Instance) error
+}
+
+// TransferRequest identifies one active assignment, trusted operator, replacement assignee, and audit reason.
+//
+// ActorID must come from host-established identity rather than an untrusted request body. NewAssignee is a concrete
+// host identity, while Reason is persisted verbatim after Engine rejects blank input. The request carries no
+// authorization decision; Engine delegates operator and target eligibility to TransferPolicy.
+type TransferRequest struct {
+	// InstanceID identifies the running aggregate that owns the assignment and must be non-empty.
+	InstanceID InstanceID `json:"instanceId"`
+	// TaskID identifies the current active assignment and must be non-empty.
+	TaskID TaskID `json:"taskId"`
+	// ActorID identifies the authenticated host principal requesting transfer and must be non-empty.
+	ActorID ActorID `json:"actorId"`
+	// NewAssignee identifies the concrete replacement owner and must be non-empty.
+	NewAssignee ActorID `json:"newAssignee"`
+	// Reason explains the transfer for audit and must contain at least one non-whitespace character.
+	Reason string `json:"reason"`
+}
+
+// TransferPolicy authorizes one operator and replacement owner against the current active assignment.
+//
+// Engine supplies the validated request, a value copy of the current task, and a defensive pre-transition aggregate.
+// Implementations own host identity, tenant, delegation, and assignee-validity rules; a non-nil error denies transfer.
+// They must honor context cancellation for blocking work and be safe for the host's Engine concurrency model.
+type TransferPolicy interface {
+	// AuthorizeTransfer returns nil only when the operator may transfer the task to the requested assignee.
+	AuthorizeTransfer(ctx context.Context, request TransferRequest, task Task, instance *Instance) error
 }
 
 // Command asks the handler for the current node to process one task action.

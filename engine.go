@@ -28,6 +28,10 @@ var (
 	ErrInvalidReturnRequest = errors.New("workflow: invalid return request")
 	// ErrInvalidReturnTarget means return selected a control, current, absent, unvisited, or non-task node.
 	ErrInvalidReturnTarget = errors.New("workflow: invalid return target")
+	// ErrInvalidTransferRequest means transfer lacks identity, a reason, a replacement owner, or host policy.
+	ErrInvalidTransferRequest = errors.New("workflow: invalid transfer request")
+	// ErrTaskNotTransferable means transfer selected a missing, historical, inactive, or non-current assignment.
+	ErrTaskNotTransferable = errors.New("workflow: task is not transferable")
 	// ErrInvalidNodeResult means a handler returned state the engine cannot safely persist.
 	ErrInvalidNodeResult = errors.New("workflow: invalid node result")
 )
@@ -295,6 +299,126 @@ func (e *Engine) Return(
 			return e.applyReturnTransition(instance, target, result)
 		},
 	})
+}
+
+// Transfer authorizes and atomically replaces one active task assignment without rewriting its history.
+//
+// request identities, non-blank reason, and policy are required. Engine accepts only an active task owned by the
+// current node, then supplies its pre-transition snapshot to host policy for operator and target validation. Success
+// closes the old task, appends a fresh active task for NewAssignee, records fully attributed audit metadata, increments
+// Version once, and commits the aggregate through one Store.Save CAS. Every error leaves durable state unchanged;
+// Definition, Approval config, prior tasks, and the returned snapshot remain detached from caller mutation.
+func (e *Engine) Transfer(
+	ctx context.Context,
+	request TransferRequest,
+	policy TransferPolicy,
+) (*Instance, error) {
+	// Transfer needs persistence and complete trusted boundary input before loading durable state.
+	if e == nil || e.store == nil {
+		return nil, fmt.Errorf("%w: transfer store is nil", ErrInvalidEngine)
+	}
+	if request.InstanceID == "" || request.TaskID == "" || request.ActorID == "" || request.NewAssignee == "" ||
+		strings.TrimSpace(request.Reason) == "" || policy == nil {
+		return nil, fmt.Errorf("%w: instance, task, actor, assignee, reason, or policy is empty", ErrInvalidTransferRequest)
+	}
+
+	// Resolve and authorize the exact active assignment before constructing its replacement task.
+	var currentTask Task
+	var replacement Task
+	return e.executeInstanceCommand(ctx, instanceCommand{
+		name:            "task transfer",
+		instanceID:      request.InstanceID,
+		nonRunningError: ErrInstanceNotRunning,
+		prepare: func(snapshot *Instance) error {
+			var err error
+			currentTask, replacement, err = prepareTransfer(ctx, request, policy, snapshot)
+			return err
+		},
+		audit: func(instance *Instance) AuditRecord {
+			return AuditRecord{
+				Action:           "task.transferred",
+				InstanceID:       instance.ID,
+				NodeID:           currentTask.NodeID,
+				TaskID:           currentTask.ID,
+				ActorID:          request.ActorID,
+				PreviousAssignee: currentTask.Assignee,
+				NewAssignee:      request.NewAssignee,
+				Reason:           request.Reason,
+			}
+		},
+		transition: func(instance *Instance) error {
+			return applyTransfer(instance, currentTask, replacement)
+		},
+	})
+}
+
+// prepareTransfer resolves the active source assignment, authorizes replacement, and creates its detached successor.
+//
+// request has passed boundary validation and snapshot is the detached running aggregate loaded for this command.
+// policy receives that snapshot and the exact current task before any candidate mutation. Success returns value-owned
+// source and replacement tasks; errors preserve ErrTaskNotTransferable, host policy causes, or task-ID generation
+// failures and leave snapshot unchanged.
+func prepareTransfer(
+	ctx context.Context,
+	request TransferRequest,
+	policy TransferPolicy,
+	snapshot *Instance,
+) (Task, Task, error) {
+	// Resolve the requested identity from the complete historical task set without accepting a prior node's task.
+	var currentTask Task
+	found := false
+	for _, task := range snapshot.Tasks {
+		if task.ID == request.TaskID {
+			currentTask = task
+			found = true
+			// Task IDs are aggregate-unique, so later historical rows cannot change the resolved source.
+			break
+		}
+	}
+	// Only the current node's active assignment can acquire a replacement owner.
+	if !found || currentTask.NodeID != snapshot.CurrentNodeID || currentTask.Status != TaskStatusActive {
+		return Task{}, Task{}, fmt.Errorf(
+			"%w: task %q is not active at node %q",
+			ErrTaskNotTransferable,
+			request.TaskID,
+			snapshot.CurrentNodeID,
+		)
+	}
+
+	// Host policy owns operator authority and replacement identity validity for the resolved assignment.
+	if err := policy.AuthorizeTransfer(ctx, request, currentTask, snapshot); err != nil {
+		return Task{}, Task{}, fmt.Errorf("workflow: authorize task transfer: %w", err)
+	}
+	// Allocate the successor identity only after authorization so denied requests consume no assignment identity.
+	id, err := newTaskID()
+	if err != nil {
+		return Task{}, Task{}, err
+	}
+	replacement := Task{
+		ID:       id,
+		NodeID:   currentTask.NodeID,
+		Assignee: request.NewAssignee,
+		Status:   TaskStatusActive,
+	}
+	return currentTask, replacement, nil
+}
+
+// applyTransfer closes one exact historical assignment and appends its already-validated active replacement.
+//
+// instance is the command's private mutable candidate. currentTask and replacement must originate from
+// prepareTransfer for the same snapshot. Success preserves task order and every existing field except the source
+// status; a missing source wraps ErrTaskNotTransferable and appends nothing.
+func applyTransfer(instance *Instance, currentTask Task, replacement Task) error {
+	// Preserve the original assignment in place and append the replacement as a distinct historical fact.
+	for index := range instance.Tasks {
+		if instance.Tasks[index].ID == currentTask.ID {
+			instance.Tasks[index].Status = TaskStatusClosed
+			instance.Tasks = append(instance.Tasks, replacement)
+			// Aggregate-unique task identity makes the first match the only source mutation required.
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: task %q disappeared before transition", ErrTaskNotTransferable, currentTask.ID)
 }
 
 // prepareReturn validates one historical target, authorizes it, and activates detached task drafts.

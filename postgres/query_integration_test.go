@@ -28,6 +28,19 @@ func (f projectionReturnPolicyFunc) AuthorizeReturn(
 	return f(ctx, request, instance)
 }
 
+// projectionTransferPolicyFunc adapts one test authorization decision to workflow.TransferPolicy.
+type projectionTransferPolicyFunc func(context.Context, workflow.TransferRequest, workflow.Task, *workflow.Instance) error
+
+// AuthorizeTransfer delegates the host decision without changing its result or error identity.
+func (f projectionTransferPolicyFunc) AuthorizeTransfer(
+	ctx context.Context,
+	request workflow.TransferRequest,
+	task workflow.Task,
+	instance *workflow.Instance,
+) error {
+	return f(ctx, request, task, instance)
+}
+
 // projectionRoleResolverFunc adapts one host-owned role lookup to Approval's organization boundary.
 type projectionRoleResolverFunc func(context.Context, string, json.RawMessage) ([]workflow.ActorID, error)
 
@@ -398,6 +411,93 @@ func TestProjectionReturnKeepsOldRoundAndAddsNewWorklist(t *testing.T) {
 	}
 	if len(secondReviewer.Items) != 1 || secondReviewer.Items[0].TaskStatus != workflow.TaskStatusClosed {
 		t.Errorf("Participated(reviewer-b) items = %#v, want closed source task", secondReviewer.Items)
+	}
+}
+
+// TestProjectionTransferMovesAssignmentBetweenActors verifies task history and candidate ownership commit together.
+func TestProjectionTransferMovesAssignmentBetweenActors(t *testing.T) {
+	dsn := requireIntegrationDSN(t)
+	pool := newProjectionPool(t, dsn)
+	store := postgres.New(pool)
+	registry := workflow.NewRegistry()
+	if err := registry.Register(approval.Kind, approval.NewHandler()); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	engine := workflow.NewEngine(store, registry)
+	instance, err := engine.Start(
+		t.Context(),
+		projectionApprovalDefinition(t, "transfer-projection", []workflow.ActorID{"reviewer-a"}),
+		workflow.StartRequest{ID: "transfer-projection-1", Initiator: "requester-a"},
+	)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	oldTaskID := instance.Tasks[0].ID
+	policy := projectionTransferPolicyFunc(func(
+		context.Context,
+		workflow.TransferRequest,
+		workflow.Task,
+		*workflow.Instance,
+	) error {
+		return nil
+	})
+	transferred, err := engine.Transfer(t.Context(), workflow.TransferRequest{
+		InstanceID:  instance.ID,
+		TaskID:      oldTaskID,
+		ActorID:     "reviewer-a",
+		NewAssignee: "reviewer-b",
+		Reason:      "projection ownership change",
+	}, policy)
+	if err != nil {
+		t.Fatalf("Transfer() error = %v", err)
+	}
+	newTaskID := transferred.Tasks[len(transferred.Tasks)-1].ID
+
+	// Reload through the durable Store seam before querying to verify audit and assignment metadata committed together.
+	stored, err := store.Load(t.Context(), instance.ID)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	audit := stored.Audit[len(stored.Audit)-1]
+	if audit.Action != "task.transferred" || audit.InstanceID != instance.ID || audit.NodeID != "review" ||
+		audit.TaskID != oldTaskID || audit.ActorID != "reviewer-a" || audit.PreviousAssignee != "reviewer-a" ||
+		audit.NewAssignee != "reviewer-b" || audit.Reason != "projection ownership change" {
+		t.Errorf("durable transfer audit = %#v, want complete attribution", audit)
+	}
+
+	// The old actor loses its candidate and retains the closed assignment as participation in the same commit.
+	projection := postgres.NewProjection(pool)
+	oldWorklist, err := projection.Worklist(t.Context(), postgres.ActorQuery{ActorID: "reviewer-a"})
+	if err != nil {
+		t.Fatalf("Worklist(old actor) error = %v", err)
+	}
+	oldParticipation, err := projection.Participated(t.Context(), postgres.ActorQuery{ActorID: "reviewer-a"})
+	if err != nil {
+		t.Fatalf("Participated(old actor) error = %v", err)
+	}
+	if len(oldWorklist.Items) != 0 {
+		t.Errorf("Worklist(old actor) items = %#v, want empty", oldWorklist.Items)
+	}
+	if len(oldParticipation.Items) != 1 || oldParticipation.Items[0].TaskID != oldTaskID ||
+		oldParticipation.Items[0].TaskStatus != workflow.TaskStatusClosed {
+		t.Errorf("Participated(old actor) items = %#v, want closed original assignment", oldParticipation.Items)
+	}
+
+	// The replacement actor sees only the fresh active assignment, not a rewritten historical task identity.
+	newWorklist, err := projection.Worklist(t.Context(), postgres.ActorQuery{ActorID: "reviewer-b"})
+	if err != nil {
+		t.Fatalf("Worklist(new actor) error = %v", err)
+	}
+	newParticipation, err := projection.Participated(t.Context(), postgres.ActorQuery{ActorID: "reviewer-b"})
+	if err != nil {
+		t.Fatalf("Participated(new actor) error = %v", err)
+	}
+	if len(newWorklist.Items) != 1 || newWorklist.Items[0].TaskID != newTaskID ||
+		newWorklist.Items[0].TaskStatus != workflow.TaskStatusActive {
+		t.Errorf("Worklist(new actor) items = %#v, want fresh active assignment", newWorklist.Items)
+	}
+	if len(newParticipation.Items) != 0 {
+		t.Errorf("Participated(new actor) items = %#v, want empty", newParticipation.Items)
 	}
 }
 
