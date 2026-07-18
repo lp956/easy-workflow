@@ -1,16 +1,13 @@
-// This file implements graph navigation, optimistic command handling, and immutable audit recording.
-// Business decisions stay in handlers; Engine alone applies accepted results to durable instance state.
+// This file coordinates graph navigation, handlers, policies, and optimistic persistence for workflow commands.
+// Business decisions stay in handlers; accepted aggregate changes pass through the internal instance-facts boundary.
 package workflow
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
-	"time"
 )
 
 var (
@@ -47,8 +44,8 @@ type Engine struct {
 
 // instanceCommand defines the invariant execution phases shared by task and lifecycle commands.
 //
-// prepare validates operation-specific state and authorization against a defensive snapshot. audit builds the
-// causal record appended before transition mutates the loaded aggregate. executeInstanceCommand owns loading,
+// prepare validates operation-specific state and authorization against a defensive snapshot. audit asks the fact
+// boundary to append its causal record before transition adds related changes. executeInstanceCommand owns loading,
 // running-state enforcement, version advancement, CAS persistence, and detached result ownership.
 type instanceCommand struct {
 	// name identifies the operation in load and persistence error context.
@@ -59,10 +56,10 @@ type instanceCommand struct {
 	nonRunningError error
 	// prepare validates and authorizes against a detached pre-transition snapshot.
 	prepare func(*Instance) error
-	// audit constructs the immutable causal record from the loaded pre-transition aggregate.
-	audit func(*Instance) AuditRecord
+	// audit appends the immutable causal record through the fact boundary before transition mutation.
+	audit func(*instanceFacts)
 	// transition applies operation-specific aggregate changes after audit append.
-	transition func(*Instance) error
+	transition func(*instanceFacts) error
 }
 
 // NewEngine constructs an engine with explicit persistence and handler dependencies.
@@ -93,29 +90,20 @@ func (e *Engine) Start(ctx context.Context, definition *Definition, request Star
 	}
 
 	// Use the compiler-owned snapshot so caller mutation cannot invalidate the execution plan or new instance.
-	instance := &Instance{
-		ID:         request.ID,
-		Definition: cloneDefinition(plan.definition),
-		Status:     InstanceStatusRunning,
-		Initiator:  request.Initiator,
-		Data:       slices.Clone(request.Data),
-		Version:    1,
-	}
 	start, err := plan.startNode()
 	if err != nil {
 		return nil, err
 	}
-	instance.CurrentNodeID = start.ID
-	e.appendAudit(instance, AuditRecord{Action: "instance.started", NodeID: start.ID, ActorID: request.Initiator})
+	facts := startInstanceFacts(plan.definition, request, start.ID)
 
 	// Start nodes are control-only, so execution immediately follows their unconditional outgoing edge.
-	if err := e.advance(ctx, instance, plan, ""); err != nil {
+	if err := e.advance(ctx, facts, plan, ""); err != nil {
 		return nil, err
 	}
-	if err := e.store.Create(ctx, instance); err != nil {
+	if err := e.store.Create(ctx, facts.candidate()); err != nil {
 		return nil, fmt.Errorf("workflow: persist new instance: %w", err)
 	}
-	return cloneInstance(instance), nil
+	return cloneInstance(facts.candidate()), nil
 }
 
 // StartPublished resolves one exact immutable Definition version and starts an instance from its snapshot.
@@ -180,7 +168,7 @@ func (e *Engine) Handle(ctx context.Context, command Command) (*Instance, error)
 				Config:  slices.Clone(node.Config),
 				Data:    slices.Clone(snapshot.Data),
 				State:   slices.Clone(snapshot.NodeState),
-				Tasks:   tasksForNode(snapshot.Tasks, node.ID),
+				Tasks:   nodeTasks(snapshot.Tasks, node.ID),
 				Command: command,
 			})
 			if err != nil {
@@ -188,16 +176,11 @@ func (e *Engine) Handle(ctx context.Context, command Command) (*Instance, error)
 			}
 			return nil
 		},
-		audit: func(*Instance) AuditRecord {
-			return AuditRecord{
-				Action:  "task." + command.Name,
-				NodeID:  node.ID,
-				TaskID:  command.TaskID,
-				ActorID: command.ActorID,
-			}
+		audit: func(facts *instanceFacts) {
+			facts.recordTaskCommand(command.Name, node.ID, command.TaskID, command.ActorID)
 		},
-		transition: func(instance *Instance) error {
-			return e.applyResult(ctx, instance, plan, node, result)
+		transition: func(facts *instanceFacts) error {
+			return e.applyResult(ctx, facts, plan, node, result)
 		},
 	})
 }
@@ -233,20 +216,11 @@ func (e *Engine) Withdraw(
 			}
 			return nil
 		},
-		audit: func(instance *Instance) AuditRecord {
-			return AuditRecord{
-				Action:  "instance.withdrawn",
-				NodeID:  instance.CurrentNodeID,
-				ActorID: request.ActorID,
-			}
+		audit: func(facts *instanceFacts) {
+			facts.recordWithdrawal(request.ActorID)
 		},
-		transition: func(instance *Instance) error {
-			instance.Status = InstanceStatusWithdrawn
-			for index := range instance.Tasks {
-				if instance.Tasks[index].Status == TaskStatusActive {
-					instance.Tasks[index].Status = TaskStatusClosed
-				}
-			}
+		transition: func(facts *instanceFacts) error {
+			facts.withdraw()
 			return nil
 		},
 	})
@@ -285,18 +259,11 @@ func (e *Engine) Return(
 			target, result, err = e.prepareReturn(ctx, request, policy, snapshot)
 			return err
 		},
-		audit: func(instance *Instance) AuditRecord {
-			return AuditRecord{
-				Action:       "instance.returned",
-				NodeID:       instance.CurrentNodeID,
-				TargetNodeID: target.ID,
-				ActorID:      request.ActorID,
-				Reason:       request.Reason,
-				NodeState:    string(instance.NodeState),
-			}
+		audit: func(facts *instanceFacts) {
+			facts.recordReturn(target.ID, request.ActorID, request.Reason)
 		},
-		transition: func(instance *Instance) error {
-			return e.applyReturnTransition(instance, target, result)
+		transition: func(facts *instanceFacts) error {
+			return facts.returnTo(target.ID, result)
 		},
 	})
 }
@@ -324,46 +291,35 @@ func (e *Engine) Transfer(
 
 	// Resolve and authorize the exact active assignment before constructing its replacement task.
 	var currentTask Task
-	var replacement Task
 	return e.executeInstanceCommand(ctx, instanceCommand{
 		name:            "task transfer",
 		instanceID:      request.InstanceID,
 		nonRunningError: ErrInstanceNotRunning,
 		prepare: func(snapshot *Instance) error {
 			var err error
-			currentTask, replacement, err = prepareTransfer(ctx, request, policy, snapshot)
+			currentTask, err = prepareTransfer(ctx, request, policy, snapshot)
 			return err
 		},
-		audit: func(instance *Instance) AuditRecord {
-			return AuditRecord{
-				Action:           "task.transferred",
-				InstanceID:       instance.ID,
-				NodeID:           currentTask.NodeID,
-				TaskID:           currentTask.ID,
-				ActorID:          request.ActorID,
-				PreviousAssignee: currentTask.Assignee,
-				NewAssignee:      request.NewAssignee,
-				Reason:           request.Reason,
-			}
+		audit: func(facts *instanceFacts) {
+			facts.recordTransfer(currentTask, request.ActorID, request.NewAssignee, request.Reason)
 		},
-		transition: func(instance *Instance) error {
-			return applyTransfer(instance, currentTask, replacement)
+		transition: func(facts *instanceFacts) error {
+			return facts.transfer(currentTask, request.NewAssignee)
 		},
 	})
 }
 
-// prepareTransfer resolves the active source assignment, authorizes replacement, and creates its detached successor.
+// prepareTransfer resolves and authorizes the active source assignment before the fact boundary creates its successor.
 //
 // request has passed boundary validation and snapshot is the detached running aggregate loaded for this command.
-// policy receives that snapshot and the exact current task before any candidate mutation. Success returns value-owned
-// source and replacement tasks; errors preserve ErrTaskNotTransferable, host policy causes, or task-ID generation
-// failures and leave snapshot unchanged.
+// policy receives that snapshot and the exact current task before any candidate mutation. Success returns the
+// value-owned source task; errors preserve ErrTaskNotTransferable or host policy causes and leave snapshot unchanged.
 func prepareTransfer(
 	ctx context.Context,
 	request TransferRequest,
 	policy TransferPolicy,
 	snapshot *Instance,
-) (Task, Task, error) {
+) (Task, error) {
 	// Resolve the requested identity from the complete historical task set without accepting a prior node's task.
 	var currentTask Task
 	found := false
@@ -377,7 +333,7 @@ func prepareTransfer(
 	}
 	// Only the current node's active assignment can acquire a replacement owner.
 	if !found || currentTask.NodeID != snapshot.CurrentNodeID || currentTask.Status != TaskStatusActive {
-		return Task{}, Task{}, fmt.Errorf(
+		return Task{}, fmt.Errorf(
 			"%w: task %q is not active at node %q",
 			ErrTaskNotTransferable,
 			request.TaskID,
@@ -387,38 +343,9 @@ func prepareTransfer(
 
 	// Host policy owns operator authority and replacement identity validity for the resolved assignment.
 	if err := policy.AuthorizeTransfer(ctx, request, currentTask, snapshot); err != nil {
-		return Task{}, Task{}, fmt.Errorf("workflow: authorize task transfer: %w", err)
+		return Task{}, fmt.Errorf("workflow: authorize task transfer: %w", err)
 	}
-	// Allocate the successor identity only after authorization so denied requests consume no assignment identity.
-	id, err := newTaskID()
-	if err != nil {
-		return Task{}, Task{}, err
-	}
-	replacement := Task{
-		ID:       id,
-		NodeID:   currentTask.NodeID,
-		Assignee: request.NewAssignee,
-		Status:   TaskStatusActive,
-	}
-	return currentTask, replacement, nil
-}
-
-// applyTransfer closes one exact historical assignment and appends its already-validated active replacement.
-//
-// instance is the command's private mutable candidate. currentTask and replacement must originate from
-// prepareTransfer for the same snapshot. Success preserves task order and every existing field except the source
-// status; a missing source wraps ErrTaskNotTransferable and appends nothing.
-func applyTransfer(instance *Instance, currentTask Task, replacement Task) error {
-	// Preserve the original assignment in place and append the replacement as a distinct historical fact.
-	for index := range instance.Tasks {
-		if instance.Tasks[index].ID == currentTask.ID {
-			instance.Tasks[index].Status = TaskStatusClosed
-			instance.Tasks = append(instance.Tasks, replacement)
-			// Aggregate-unique task identity makes the first match the only source mutation required.
-			return nil
-		}
-	}
-	return fmt.Errorf("%w: task %q disappeared before transition", ErrTaskNotTransferable, currentTask.ID)
+	return currentTask, nil
 }
 
 // prepareReturn validates one historical target, authorizes it, and activates detached task drafts.
@@ -477,31 +404,6 @@ func (e *Engine) prepareReturn(
 	return target, result, nil
 }
 
-// applyReturnTransition closes source work and appends one freshly activated target task round.
-//
-// instance is the private loaded aggregate after return audit append. target and result must come from
-// prepareReturn for the same frozen Definition. The method preserves historical tasks and outcomes, replaces
-// current NodeState only after it was captured by the audit record, appends target entry audit, and performs no I/O.
-func (e *Engine) applyReturnTransition(
-	instance *Instance,
-	target *NodeDefinition,
-	result NodeResult,
-) error {
-	// Close only source-active tasks without revising completed or earlier-node assignment history.
-	sourceNodeID := instance.CurrentNodeID
-	for index := range instance.Tasks {
-		if instance.Tasks[index].NodeID == sourceNodeID && instance.Tasks[index].Status == TaskStatusActive {
-			instance.Tasks[index].Status = TaskStatusClosed
-		}
-	}
-
-	// Enter the explicit target and append new drafts after all historical tasks retain their original order.
-	instance.CurrentNodeID = target.ID
-	instance.NodeState = slices.Clone(result.State)
-	e.appendAudit(instance, AuditRecord{Action: "node.entered", NodeID: target.ID})
-	return e.applyNodeTasks(instance, target.ID, result.Tasks, false)
-}
-
 // executeInstanceCommand applies the invariant command sequence around one operation-specific transition.
 //
 // command must provide an identity, stable terminal-state error, prepare, audit, and transition callbacks.
@@ -532,23 +434,28 @@ func (e *Engine) executeInstanceCommand(
 	if err := command.prepare(cloneInstance(instance)); err != nil {
 		return nil, err
 	}
-	e.appendAudit(instance, command.audit(instance))
-	if err := command.transition(instance); err != nil {
+	facts := newInstanceFacts(instance)
+	command.audit(facts)
+	if err := command.transition(facts); err != nil {
 		return nil, err
 	}
-	instance.Version++
+	facts.advanceVersion()
 
 	// One aggregate CAS commits every task, state, audit, status, and version change or none of them.
-	if err := e.store.Save(ctx, instance, expectedVersion); err != nil {
+	if err := e.store.Save(ctx, facts.candidate(), expectedVersion); err != nil {
 		return nil, fmt.Errorf("workflow: persist %s: %w", command.name, err)
 	}
 	return cloneInstance(instance), nil
 }
 
 // hasEnteredNode reports whether immutable audit history proves that nodeID executed before the current command.
+//
+// audit is the detached pre-transition history and nodeID is the explicit return target. The scan performs no
+// mutation or I/O; false means no stable node-entry fact exists and therefore the target is not return-eligible.
 func hasEnteredNode(audit []AuditRecord, nodeID string) bool {
 	for _, record := range audit {
-		if record.Action == "node.entered" && record.NodeID == nodeID {
+		// Both the stable action and exact node identity must match one previously accepted entry fact.
+		if record.Action == auditNodeEntered && record.NodeID == nodeID {
 			return true
 		}
 	}
@@ -575,28 +482,25 @@ func (e *Engine) validateCommand(command Command) error {
 	return nil
 }
 
-// advance follows compiled routes and activates nodes until execution waits or reaches a terminal state.
+// advance follows compiled routes and asks the fact boundary to record nodes until execution waits or terminates.
 //
-// instance is the caller-owned aggregate being prepared for one atomic Store write. plan must be compiled
-// from instance.Definition, and outcome selects the first route; an empty outcome is unconditional. Handler
-// or routing errors leave durable state unchanged because callers persist only after this method succeeds.
-func (e *Engine) advance(ctx context.Context, instance *Instance, plan *compiledDefinition, outcome string) error {
+// facts wraps the caller-owned aggregate being prepared for one atomic Store write. plan must be compiled from that
+// aggregate's Definition, and outcome selects the first route; an empty outcome is unconditional. Handler or routing
+// errors leave durable state unchanged because callers persist only after this method succeeds.
+func (e *Engine) advance(ctx context.Context, facts *instanceFacts, plan *compiledDefinition, outcome string) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("workflow: advance instance: %w", err)
 		}
-		next, err := plan.nextNode(instance.CurrentNodeID, outcome)
+		next, err := plan.nextNode(facts.candidate().CurrentNodeID, outcome)
 		if err != nil {
 			return err
 		}
-		instance.CurrentNodeID = next.ID
-		instance.NodeState = nil
-		e.appendAudit(instance, AuditRecord{Action: "node.entered", NodeID: next.ID})
+		facts.enterNode(next.ID)
 
 		// End nodes complete immediately; other business nodes decide whether to wait or continue again.
 		if next.Kind == KindEnd {
-			instance.Status = InstanceStatusCompleted
-			e.appendAudit(instance, AuditRecord{Action: "instance.completed", NodeID: next.ID})
+			facts.complete()
 			return nil
 		}
 		handler, err := e.registry.handler(next.Kind)
@@ -605,15 +509,15 @@ func (e *Engine) advance(ctx context.Context, instance *Instance, plan *compiled
 		}
 		result, err := handler.Activate(ctx, ActivationInput{
 			Config: slices.Clone(next.Config),
-			Data:   slices.Clone(instance.Data),
+			Data:   slices.Clone(facts.candidate().Data),
 		})
 		if err != nil {
 			return fmt.Errorf("workflow: activate node %q: %w", next.ID, err)
 		}
-		if err := e.applyNodeTasks(instance, next.ID, result.Tasks, false); err != nil {
+		if err := facts.activateTasks(next.ID, result.Tasks); err != nil {
 			return err
 		}
-		instance.NodeState = slices.Clone(result.State)
+		facts.setNodeState(result.State)
 		switch result.Disposition {
 		case DispositionWaiting:
 			return nil
@@ -622,14 +526,13 @@ func (e *Engine) advance(ctx context.Context, instance *Instance, plan *compiled
 		case DispositionReject:
 			// Synchronous handlers use the same explicit outcome contract as command-driven handlers.
 			if result.Outcome != "" {
-				e.appendAudit(instance, AuditRecord{Action: "node.rejected", NodeID: next.ID})
+				facts.rejectNode()
 				outcome = result.Outcome
 				continue
 			}
 
 			// Empty rejection outcomes retain the global terminal behavior.
-			instance.Status = InstanceStatusRejected
-			e.appendAudit(instance, AuditRecord{Action: "instance.rejected", NodeID: next.ID})
+			facts.rejectInstance()
 			return nil
 		case DispositionUnknown:
 			return fmt.Errorf("%w: node %q returned an empty disposition", ErrInvalidNodeResult, next.ID)
@@ -639,114 +542,42 @@ func (e *Engine) advance(ctx context.Context, instance *Instance, plan *compiled
 	}
 }
 
-// applyResult validates and applies one handler result to the caller-owned aggregate.
+// applyResult validates one handler result and delegates its accepted facts to the caller-owned candidate.
 //
-// plan and node must belong to instance.Definition. Waiting replaces current tasks, continue requires the
+// plan and node must belong to facts.candidate().Definition. Waiting replaces current tasks, continue requires the
 // result outcome route, and reject either terminates with an empty outcome or requires its outcome route.
 // Errors prevent the enclosing Handle operation from saving the mutated snapshot; this method performs no
 // Store I/O itself.
 func (e *Engine) applyResult(
 	ctx context.Context,
-	instance *Instance,
+	facts *instanceFacts,
 	plan *compiledDefinition,
 	node *NodeDefinition,
 	result NodeResult,
 ) error {
-	if err := e.applyNodeTasks(instance, node.ID, result.Tasks, true); err != nil {
+	if err := facts.replaceNodeTasks(node.ID, result.Tasks); err != nil {
 		return err
 	}
-	instance.NodeState = slices.Clone(result.State)
+	facts.setNodeState(result.State)
 	switch result.Disposition {
 	case DispositionWaiting:
 		return nil
 	case DispositionContinue:
-		return e.advance(ctx, instance, plan, result.Outcome)
+		return e.advance(ctx, facts, plan, result.Outcome)
 	case DispositionReject:
 		// A handler may name only an outcome; the compiled Definition remains the sole owner of its target node.
 		if result.Outcome != "" {
 			// Record rejection before target entry; callers discard both mutations when route resolution fails.
-			e.appendAudit(instance, AuditRecord{Action: "node.rejected", NodeID: node.ID})
-			return e.advance(ctx, instance, plan, result.Outcome)
+			facts.rejectNode()
+			return e.advance(ctx, facts, plan, result.Outcome)
 		}
 
 		// An empty outcome preserves the original terminal rejection contract.
-		instance.Status = InstanceStatusRejected
-		e.appendAudit(instance, AuditRecord{Action: "instance.rejected", NodeID: node.ID})
+		facts.rejectInstance()
 		return nil
 	case DispositionUnknown:
 		return fmt.Errorf("%w: node %q returned an empty disposition", ErrInvalidNodeResult, node.ID)
 	default:
 		return fmt.Errorf("%w: node %q returned disposition %q", ErrInvalidNodeResult, node.ID, result.Disposition)
 	}
-}
-
-// applyNodeTasks assigns IDs to activation drafts or replaces the exact task set returned after a command.
-func (e *Engine) applyNodeTasks(instance *Instance, nodeID string, tasks []Task, isReplacement bool) error {
-	if isReplacement {
-		// Replace by ID while preserving task order and all historical tasks from other nodes.
-		updates := make(map[TaskID]Task, len(tasks))
-		for _, task := range tasks {
-			if task.ID == "" || task.NodeID != nodeID {
-				return fmt.Errorf("%w: replacement task identity is invalid", ErrInvalidNodeResult)
-			}
-			updates[task.ID] = task
-		}
-		for i := range instance.Tasks {
-			if instance.Tasks[i].NodeID != nodeID {
-				continue
-			}
-			updated, exists := updates[instance.Tasks[i].ID]
-			if !exists {
-				return fmt.Errorf("%w: handler omitted task %q", ErrInvalidNodeResult, instance.Tasks[i].ID)
-			}
-			instance.Tasks[i] = updated
-			delete(updates, updated.ID)
-		}
-		if len(updates) != 0 {
-			return fmt.Errorf("%w: handler introduced unknown task", ErrInvalidNodeResult)
-		}
-		return nil
-	}
-
-	// Activation tasks are drafts: the engine binds node ownership and creates collision-resistant IDs.
-	for _, task := range tasks {
-		if task.ID != "" || task.Assignee == "" || task.Status != TaskStatusActive {
-			return fmt.Errorf("%w: activation task is invalid", ErrInvalidNodeResult)
-		}
-		id, err := newTaskID()
-		if err != nil {
-			return err
-		}
-		task.ID = id
-		task.NodeID = nodeID
-		instance.Tasks = append(instance.Tasks, task)
-	}
-	return nil
-}
-
-// appendAudit stamps and appends one immutable transition record in execution order.
-func (e *Engine) appendAudit(instance *Instance, record AuditRecord) {
-	record.At = time.Now().UTC()
-	instance.Audit = append(instance.Audit, record)
-}
-
-// tasksForNode returns a defensive copy of every historical or current task owned by nodeID.
-func tasksForNode(tasks []Task, nodeID string) []Task {
-	result := make([]Task, 0, len(tasks))
-	for _, task := range tasks {
-		if task.NodeID == nodeID {
-			result = append(result, task)
-		}
-	}
-	return result
-}
-
-// newTaskID generates a process-independent task identifier using 128 bits from crypto/rand.
-func newTaskID() (TaskID, error) {
-	const randomBytes = 16 // 128 random bits make collisions negligible without a shared generator.
-	buffer := make([]byte, randomBytes)
-	if _, err := rand.Read(buffer); err != nil {
-		return "", fmt.Errorf("workflow: generate task id: %w", err)
-	}
-	return TaskID("task_" + hex.EncodeToString(buffer)), nil
 }
