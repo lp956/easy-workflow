@@ -15,6 +15,9 @@
 // persistence, delegates atomic monotonically increasing version allocation to DefinitionVersionWriter, and leaves
 // failed publication without a consumed version. DefinitionReader selects either one exact immutable version or
 // the current latest snapshot; Engine.StartPublished always freezes the exact version passed to it.
+// DefinitionVersionWriter and DefinitionReader remain separate capability interfaces so publication depends only
+// on writes and startup depends only on exact reads. MemoryDefinitionStore is the process-local reference adapter,
+// while official durable adapters must satisfy the same reusable definitiontest contract.
 //
 // Official node behavior lives in the approval and condition packages. PostgreSQL durability and query projections
 // live in the optional postgres package. HTTP transports, Web UI, organization directories, authorization, and

@@ -165,12 +165,17 @@ EASY_WORKFLOW_POSTGRES_DSN='postgres://user:password@localhost:5432/easy_workflo
 - `NodeHandler`：`Validate` 在启动或发布前校验配置；`Activate` 和 `Handle` 只返回声明式 `NodeResult`，不能直接访问 Store 或任意跳转。handler 必须能被不同 Instance 并发调用，阻塞工作必须遵守 context cancellation。
 - Definition 发布：发布前完整编译；失败不占版本、不留部分记录。writer 为同一 ID 原子分配严格递增版本并保存防御性快照；reader 的 `Load` 只读指定版本且不 fallback，`LoadLatest` 读取当前最大版本。发布与读取必须支持并发。
 
+`DefinitionVersionWriter` 与 `DefinitionReader` 是刻意分离的 capability seam：`DefinitionPublisher` 只依赖写入，`Engine.StartPublished` 只依赖调用方提供的精确版本读取。`MemoryDefinitionStore` 是当前参考 adapter，而不是唯一允许的实现。新 adapter 必须原样运行 `definitiontest.RunWriter`、`definitiontest.RunReader` 和 `definitiontest.RunRepository`；Definition repository 不并入 command-side `Store`。
+
+保留条件、未来变更证据和 durable adapter 边界记录在 [Definition repository seam 架构决策](docs/architecture/definition-repository-seams.md)。
+
 这些契约的完整错误语义以相应公开类型的 Go package documentation 为准：
 
 ```bash
 go doc github.com/lvpeng/easy-workflow.Store
 go doc github.com/lvpeng/easy-workflow.NodeHandler
 go doc github.com/lvpeng/easy-workflow.DefinitionPublisher
+go doc github.com/lvpeng/easy-workflow/definitiontest
 ```
 
 ## 发布验证
