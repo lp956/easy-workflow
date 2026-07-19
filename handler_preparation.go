@@ -7,6 +7,8 @@ import (
 	"context"
 	"fmt"
 	"slices"
+
+	"github.com/lvpeng/easy-workflow/internal/nilguard"
 )
 
 // legacyPreparedNodeHandler adapts the original raw-config NodeHandler contract to prepared plan execution.
@@ -26,15 +28,15 @@ type legacyPreparedNodeHandler struct {
 // legacy Validate; other handlers are validated once and wrapped with a request-local raw-config compatibility executor.
 // A nil prepared executor returns ErrInvalidHandler. The function performs no persistence or cross-request caching.
 func prepareRegisteredNodeHandler(handler NodeHandler, config []byte) (PreparedNodeHandler, error) {
-	if handler == nil {
+	if nilguard.IsNil(handler) {
 		return nil, fmt.Errorf("%w: handler is nil", ErrInvalidHandler)
 	}
 	if preparer, ok := handler.(NodeHandlerConfigPreparer); ok {
 		prepared, err := preparer.PrepareConfig(slices.Clone(config))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("workflow: prepare node handler config: %w", err)
 		}
-		if prepared == nil {
+		if nilguard.IsNil(prepared) {
 			return nil, fmt.Errorf("%w: config preparer returned nil", ErrInvalidHandler)
 		}
 		return prepared, nil
@@ -42,7 +44,7 @@ func prepareRegisteredNodeHandler(handler NodeHandler, config []byte) (PreparedN
 
 	// Legacy validation still runs exactly once per complete compilation before its executor can be published.
 	if err := handler.Validate(slices.Clone(config)); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("workflow: validate legacy node handler config: %w", err)
 	}
 	return &legacyPreparedNodeHandler{handler: handler, config: slices.Clone(config)}, nil
 }
@@ -55,10 +57,14 @@ func (h *legacyPreparedNodeHandler) ActivatePrepared(
 	ctx context.Context,
 	input PreparedActivationInput,
 ) (NodeResult, error) {
-	return h.handler.Activate(ctx, ActivationInput{
+	result, err := h.handler.Activate(ctx, ActivationInput{
 		Config: slices.Clone(h.config),
 		Data:   slices.Clone(input.Data),
 	})
+	if err != nil {
+		return NodeResult{}, fmt.Errorf("workflow: activate legacy node handler: %w", err)
+	}
+	return result, nil
 }
 
 // HandlePrepared forwards one prepared-plan command through the original NodeHandler input contract.
@@ -69,11 +75,15 @@ func (h *legacyPreparedNodeHandler) HandlePrepared(
 	ctx context.Context,
 	input PreparedCommandInput,
 ) (NodeResult, error) {
-	return h.handler.Handle(ctx, CommandInput{
+	result, err := h.handler.Handle(ctx, CommandInput{
 		Command: input.Command,
 		Config:  slices.Clone(h.config),
 		Data:    slices.Clone(input.Data),
 		State:   slices.Clone(input.State),
 		Tasks:   slices.Clone(input.Tasks),
 	})
+	if err != nil {
+		return NodeResult{}, fmt.Errorf("workflow: handle legacy node handler: %w", err)
+	}
+	return result, nil
 }

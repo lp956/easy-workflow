@@ -5,10 +5,18 @@ package workflow_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 
 	workflow "github.com/lvpeng/easy-workflow"
+)
+
+var (
+	// errReaderUnavailable is the stable repository failure used to verify StartPublished error propagation.
+	errReaderUnavailable = errors.New("reader unavailable")
+	// errUnexpectedLoadLatest classifies an exact-version startup that incorrectly falls back to latest lookup.
+	errUnexpectedLoadLatest = errors.New("unexpected LoadLatest call")
 )
 
 // observingDefinitionWriter records public writer calls and returns detached version-one snapshots.
@@ -105,8 +113,7 @@ func TestDefinitionPublisherCompilesBeforeWriterInvocation(t *testing.T) {
 // StartPublished must preserve the reader's stable error cause and must not attempt any command-side persistence when
 // the exact Definition snapshot is absent or unavailable.
 func TestEngineStartPublishedStopsOnReaderError(t *testing.T) {
-	readerFailure := errors.New("reader unavailable")
-	reader := &observingDefinitionReader{err: readerFailure}
+	reader := &observingDefinitionReader{err: errReaderUnavailable}
 	instances := &observingInstanceStore{}
 	engine := workflow.NewEngine(instances, workflow.NewRegistry())
 
@@ -114,7 +121,7 @@ func TestEngineStartPublishedStopsOnReaderError(t *testing.T) {
 		ID:        "instance-a",
 		Initiator: "initiator-a",
 	})
-	if !errors.Is(err, readerFailure) {
+	if !errors.Is(err, errReaderUnavailable) {
 		t.Fatalf("StartPublished() error = %v, want reader failure", err)
 	}
 	if reader.calls != 1 || reader.id != "definition-a" || reader.version != 7 {
@@ -155,6 +162,54 @@ func TestEngineStartPublishedFreezesExactReaderSnapshot(t *testing.T) {
 	}
 }
 
+// TestPublicDependencySeamsRejectTypedNil verifies interface-wrapped nil collaborators fail with stable boundary errors.
+//
+// The fixtures use valid control-only definitions and complete request identities so only dependency validation determines
+// the result. No typed-nil method may be called, and no instance or definition persistence may be attempted.
+func TestPublicDependencySeamsRejectTypedNil(t *testing.T) {
+	t.Parallel()
+
+	definition := startableDefinition("typed-nil-dependencies", 1, "end")
+	t.Run("instance store", func(t *testing.T) {
+		t.Parallel()
+
+		var store *workflow.MemoryStore
+		_, err := workflow.NewEngine(store, workflow.NewRegistry()).Start(t.Context(), definition, workflow.StartRequest{
+			ID:        "typed-nil-store-1",
+			Initiator: "initiator-a",
+		})
+		if !errors.Is(err, workflow.ErrInvalidEngine) {
+			t.Fatalf("Start() error = %v, want ErrInvalidEngine", err)
+		}
+	})
+
+	t.Run("definition reader", func(t *testing.T) {
+		t.Parallel()
+
+		var reader *observingDefinitionReader
+		_, err := workflow.NewEngine(workflow.NewMemoryStore(), workflow.NewRegistry()).StartPublished(
+			t.Context(),
+			reader,
+			definition.ID,
+			definition.Version,
+			workflow.StartRequest{ID: "typed-nil-reader-1", Initiator: "initiator-a"},
+		)
+		if !errors.Is(err, workflow.ErrInvalidStartRequest) {
+			t.Fatalf("StartPublished() error = %v, want ErrInvalidStartRequest", err)
+		}
+	})
+
+	t.Run("definition writer", func(t *testing.T) {
+		t.Parallel()
+
+		var writer *observingDefinitionWriter
+		_, err := workflow.NewDefinitionPublisher(writer, workflow.NewRegistry()).Publish(t.Context(), definition)
+		if !errors.Is(err, workflow.ErrInvalidPublisher) {
+			t.Fatalf("Publish() error = %v, want ErrInvalidPublisher", err)
+		}
+	})
+}
+
 // CreateVersion records a detached candidate and returns a separately owned version-one snapshot.
 //
 // ctx cancellation is preserved. definition must be non-nil for this publisher seam test; the fake performs no
@@ -162,7 +217,7 @@ func TestEngineStartPublishedFreezesExactReaderSnapshot(t *testing.T) {
 func (w *observingDefinitionWriter) CreateVersion(ctx context.Context, definition *workflow.Definition) (*workflow.Definition, error) {
 	// Respect an abandoned request before recording any observable writer call.
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("test definition writer context: %w", err)
 	}
 	// Capture the candidate independently, then return another snapshot representing writer-assigned identity.
 	w.calls++
@@ -179,7 +234,7 @@ func (w *observingDefinitionWriter) CreateVersion(ctx context.Context, definitio
 func (r *observingDefinitionReader) Load(ctx context.Context, id string, version uint64) (*workflow.Definition, error) {
 	// Cancellation prevents the fake from recording a lookup that a real adapter must abandon.
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("test definition reader context: %w", err)
 	}
 	// Record the exact request before selecting the configured success or failure path.
 	r.calls++
@@ -194,7 +249,7 @@ func (r *observingDefinitionReader) Load(ctx context.Context, id string, version
 
 // LoadLatest rejects unexpected fallback because StartPublished may use only exact lookup.
 func (r *observingDefinitionReader) LoadLatest(context.Context, string) (*workflow.Definition, error) {
-	return nil, errors.New("unexpected LoadLatest call")
+	return nil, errUnexpectedLoadLatest
 }
 
 // Create records an unexpected persistence attempt without retaining caller-owned Instance data.

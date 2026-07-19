@@ -478,7 +478,7 @@ func TestProjectionQueryFamiliesApplyDocumentedLimits(t *testing.T) {
 
 	// One instance supplies enough active and completed assignments to exercise both task query views.
 	tasks := make([]workflow.Task, 0, projectionLimitFixtureCount*2) // Two task families each need maximum plus look-ahead.
-	for index := 0; index < projectionLimitFixtureCount; index++ {
+	for index := range projectionLimitFixtureCount {
 		tasks = append(tasks,
 			workflow.Task{
 				ID:       workflow.TaskID(fmt.Sprintf("limit-active-%03d", index)), // Fixed width preserves identity order through 200.

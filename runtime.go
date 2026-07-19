@@ -49,8 +49,10 @@ const (
 
 // Task is one assignment produced by the active node handler.
 //
-// The engine owns ID, NodeID, and status persistence. A handler may propose task states in NodeResult,
-// but it cannot write them directly. Outcome is handler-defined data such as "approved" or "rejected".
+// The engine owns ID, NodeID, Assignee, and status persistence. During command handling, a handler may leave an active
+// task active, complete it with a non-empty Outcome, or close it without inventing an Outcome. Completed and closed tasks
+// are immutable history; reassignment requires Engine.Transfer. Outcome is handler-defined data such as "approved" or
+// "rejected".
 type Task struct {
 	ID       TaskID     `json:"id"`
 	NodeID   string     `json:"nodeId"`

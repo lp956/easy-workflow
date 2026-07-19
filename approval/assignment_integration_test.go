@@ -194,27 +194,46 @@ func TestDynamicRoleAssignmentPropagatesCancellationAtomically(t *testing.T) {
 	}
 }
 
-// TestDynamicRoleAssignmentRequiresExplicitAdapter verifies static composition has no implicit directory fallback.
+// TestDynamicRoleAssignmentRequiresExplicitAdapter verifies nil adapters have no implicit directory fallback.
 func TestDynamicRoleAssignmentRequiresExplicitAdapter(t *testing.T) {
 	t.Parallel()
 
-	registry := workflow.NewRegistry()
-	if err := registry.Register(approval.Kind, approval.NewHandler()); err != nil {
-		t.Fatalf("Register() error = %v", err)
+	var typedNilResolver roleResolverFunc
+	tests := []struct {
+		name     string
+		handler  *approval.Handler
+		workflow string
+		instance workflow.InstanceID
+	}{
+		{name: "nil interface", handler: approval.NewHandler(), workflow: "missing-adapter", instance: "missing-adapter-1"},
+		{
+			name: "typed nil interface", handler: approval.NewHandlerWithOrganization(typedNilResolver),
+			workflow: "typed-nil-adapter", instance: "typed-nil-adapter-1",
+		},
 	}
-	store := workflow.NewMemoryStore()
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 
-	// A dynamic definition may deserialize without side effects, but activation requires an explicit host adapter.
-	_, err := workflow.NewEngine(store, registry).Start(
-		context.Background(),
-		dynamicApprovalDefinition(t, "missing-adapter", approval.ModeAny),
-		workflow.StartRequest{ID: "missing-adapter-1", Initiator: "requester"},
-	)
-	if !errors.Is(err, approval.ErrOrganizationAdapterRequired) {
-		t.Fatalf("Start() error = %v, want ErrOrganizationAdapterRequired", err)
-	}
-	if _, loadErr := store.Load(context.Background(), "missing-adapter-1"); !errors.Is(loadErr, workflow.ErrInstanceNotFound) {
-		t.Errorf("Load() error = %v, want ErrInstanceNotFound", loadErr)
+			registry := workflow.NewRegistry()
+			if err := registry.Register(approval.Kind, test.handler); err != nil {
+				t.Fatalf("Register() error = %v", err)
+			}
+			store := workflow.NewMemoryStore()
+
+			// Dynamic activation requires one callable adapter before any assignment or aggregate becomes durable.
+			_, err := workflow.NewEngine(store, registry).Start(
+				t.Context(),
+				dynamicApprovalDefinition(t, test.workflow, approval.ModeAny),
+				workflow.StartRequest{ID: test.instance, Initiator: "requester"},
+			)
+			if !errors.Is(err, approval.ErrOrganizationAdapterRequired) {
+				t.Fatalf("Start() error = %v, want ErrOrganizationAdapterRequired", err)
+			}
+			if _, loadErr := store.Load(t.Context(), test.instance); !errors.Is(loadErr, workflow.ErrInstanceNotFound) {
+				t.Errorf("Load() error = %v, want ErrInstanceNotFound", loadErr)
+			}
+		})
 	}
 }
 

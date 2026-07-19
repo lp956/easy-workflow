@@ -15,6 +15,11 @@ import (
 	"github.com/lvpeng/easy-workflow/approval"
 )
 
+var (
+	// errTestHandlerMutatedConfig classifies compiled-plan aliasing observed by the test extension.
+	errTestHandlerMutatedConfig = errors.New("test handler received mutated config")
+)
+
 // configMutatingHandler probes whether compilation exposes plan-owned configuration to extension code.
 // It retains no state, mutates only the Validate argument, and is safe for the test's concurrent package execution.
 type configMutatingHandler struct{}
@@ -31,7 +36,7 @@ func (configMutatingHandler) Validate(config json.RawMessage) error {
 func (configMutatingHandler) Activate(_ context.Context, input workflow.ActivationInput) (workflow.NodeResult, error) {
 	// Any difference proves Validate received bytes aliased with the immutable compiled snapshot.
 	if string(input.Config) != `{"outcome":"done"}` {
-		return workflow.NodeResult{}, fmt.Errorf("test handler received mutated config %q", input.Config)
+		return workflow.NodeResult{}, fmt.Errorf("%w: %q", errTestHandlerMutatedConfig, input.Config)
 	}
 	return workflow.NodeResult{Disposition: workflow.DispositionContinue, Outcome: "done"}, nil
 }
@@ -69,6 +74,7 @@ func (*definitionMutatingHandler) Handle(context.Context, workflow.CommandInput)
 type definitionCorruptingStore struct {
 	// Store supplies the real immutable snapshot and records any delegated durable mutation.
 	workflow.Store
+
 	// saveCalls counts serial CAS attempts made after a corrupted snapshot was loaded.
 	saveCalls int
 }
@@ -77,7 +83,7 @@ type definitionCorruptingStore struct {
 func (s *definitionCorruptingStore) Load(ctx context.Context, id workflow.InstanceID) (*workflow.Instance, error) {
 	instance, err := s.Store.Load(ctx, id)
 	if err != nil {
-		return nil, err // Adapter load failures remain authoritative and provide no snapshot to corrupt.
+		return nil, fmt.Errorf("test corrupting store load: %w", err)
 	}
 	instance.Definition.Edges = nil
 	return instance, nil
@@ -90,13 +96,16 @@ func (s *definitionCorruptingStore) Save(
 	expectedVersion uint64,
 ) error {
 	s.saveCalls++
-	return s.Store.Save(ctx, instance, expectedVersion)
+	if err := s.Store.Save(ctx, instance, expectedVersion); err != nil {
+		return fmt.Errorf("test corrupting store save: %w", err)
+	}
+	return nil
 }
 
-// buildDefinitionFixture recreates one canonical fixture through the public Builder authoring seam.
-// definition must be non-nil; node config bytes are passed through json.RawMessage semantics. The returned
-// Definition is caller-owned, and structural or config-encoding failures preserve Builder's public error chain.
-func buildDefinitionFixture(definition *workflow.Definition) (*workflow.Definition, error) {
+// buildDefinitionFixture validates one canonical fixture through the public Builder authoring seam.
+// definition must be non-nil; node config bytes are passed through json.RawMessage semantics. Structural or
+// config-encoding failures preserve Builder's public error chain, while successful rebuilt data is intentionally discarded.
+func buildDefinitionFixture(definition *workflow.Definition) error {
 	// Recreate every declared node with the control-node helpers used by code-authored definitions.
 	builder := workflow.NewBuilder(definition.ID)
 	for _, node := range definition.Nodes {
@@ -114,7 +123,11 @@ func buildDefinitionFixture(definition *workflow.Definition) (*workflow.Definiti
 	for _, edge := range definition.Edges {
 		builder.Connect(edge.From, edge.To, edge.Outcome)
 	}
-	return builder.Build()
+	_, err := builder.Build()
+	if err != nil {
+		return fmt.Errorf("build definition fixture: %w", err)
+	}
+	return nil
 }
 
 // TestCompileDefinitionAcceptsBuilderAndJSON verifies both authoring paths enter the same compiler.
@@ -492,7 +505,7 @@ func TestInvalidGraphClassificationMatchesAcrossPublicSeams(t *testing.T) {
 	for testIndex, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Send the same graph through code authoring, JSON authoring, publication, and Engine startup.
-			_, builderErr := buildDefinitionFixture(tt.definition)
+			builderErr := buildDefinitionFixture(tt.definition)
 			data, err := json.Marshal(tt.definition)
 			if err != nil {
 				t.Fatalf("json.Marshal() error = %v", err)
@@ -541,7 +554,7 @@ func TestInvalidGraphClassificationMatchesAcrossPublicSeams(t *testing.T) {
 		},
 		Edges: []workflow.Edge{{From: "start", To: "end", Outcome: "named"}},
 	}
-	if _, err := buildDefinitionFixture(missingStartRoute); err != nil {
+	if err := buildDefinitionFixture(missingStartRoute); err != nil {
 		t.Fatalf("Builder.Build(missing start route) error = %v, want structural success", err)
 	}
 	data, err := json.Marshal(missingStartRoute)
@@ -889,6 +902,32 @@ func TestCompileDefinitionRejectsMissingStartRoute(t *testing.T) {
 		!strings.Contains(err.Error(), `node "start"`) ||
 		!strings.Contains(err.Error(), `outcome ""`) {
 		t.Errorf("CompileDefinition() error = %v, want definition, start node, and empty outcome context", err)
+	}
+}
+
+// TestCompileDefinitionRejectsAdditionalStartBranch verifies startup cannot publish semantically dead selectors.
+//
+// Builder-level graph analysis sees both terminal nodes as reachable, but Engine can emit only the empty Start outcome.
+// Complete compilation must therefore reject the additional named selector before publication or instance creation.
+func TestCompileDefinitionRejectsAdditionalStartBranch(t *testing.T) {
+	t.Parallel()
+
+	definition := &workflow.Definition{
+		ID: "additional-start-branch",
+		Nodes: []workflow.NodeDefinition{
+			{ID: "start", Kind: workflow.KindStart},
+			{ID: "live-end", Kind: workflow.KindEnd},
+			{ID: "dead-end", Kind: workflow.KindEnd},
+		},
+		Edges: []workflow.Edge{
+			{From: "start", To: "live-end"},
+			{From: "start", To: "dead-end", Outcome: "never"},
+		},
+	}
+
+	err := workflow.CompileDefinition(definition, workflow.NewRegistry())
+	if !errors.Is(err, workflow.ErrInvalidDefinition) {
+		t.Fatalf("CompileDefinition() error = %v, want ErrInvalidDefinition", err)
 	}
 }
 

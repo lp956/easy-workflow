@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
+	"github.com/lvpeng/easy-workflow/internal/nilguard"
 )
 
 var (
@@ -64,7 +66,7 @@ func NewDefinitionPublisher(writer DefinitionVersionWriter, registry *Registry) 
 // input and storage. Errors do not consume a version or leave a partial definition in a conforming writer.
 func (p *DefinitionPublisher) Publish(ctx context.Context, definition *Definition) (*Definition, error) {
 	// Publication cannot validate or persist safely when either configured collaborator is absent.
-	if p == nil || p.writer == nil || p.registry == nil {
+	if p == nil || nilguard.IsNil(p.writer) || p.registry == nil {
 		return nil, fmt.Errorf("%w: dependencies are nil", ErrInvalidPublisher)
 	}
 	// Compilation must finish before the first storage call so invalid attempts cannot reserve a version.

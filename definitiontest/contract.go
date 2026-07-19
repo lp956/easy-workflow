@@ -6,11 +6,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"sync"
 	"testing"
 
 	workflow "github.com/lvpeng/easy-workflow"
+)
+
+var (
+	// errIncompleteConcurrentDefinition classifies a repository snapshot that mixes or omits committed fixture facts.
+	errIncompleteConcurrentDefinition = errors.New("incomplete concurrent Definition snapshot")
+	// errNilConcurrentDefinition classifies an absent snapshot returned during a successful concurrent lookup.
+	errNilConcurrentDefinition = errors.New("concurrent Definition snapshot is nil")
 )
 
 // WriterFactory creates an isolated DefinitionVersionWriter for one contract subtest.
@@ -230,12 +237,12 @@ func runRepositoryConcurrentLifecycleContract(t *testing.T, factory RepositoryFa
 			}
 		}()
 	}
-	for index := 0; index < readerCount; index++ {
+	for range readerCount {
 		// Each reader pins the observed latest identity with an exact follow-up read.
 		go func() {
 			defer operations.Done()
 			<-start
-			for attempt := 0; attempt < readsPerReader; attempt++ {
+			for range readsPerReader {
 				latest, err := reader.LoadLatest(t.Context(), "concurrent-lifecycle")
 				if err != nil {
 					operationErrors <- err
@@ -320,11 +327,26 @@ func runReaderMissingContract(t *testing.T, factory ReaderFactory) {
 		name string
 		load func() error
 	}{
-		{name: "unknown exact", load: func() error { _, err := reader.Load(t.Context(), "missing", 1); return err }},
-		{name: "zero version", load: func() error { _, err := reader.Load(t.Context(), "missing", 0); return err }},
-		{name: "empty exact ID", load: func() error { _, err := reader.Load(t.Context(), "", 1); return err }},
-		{name: "unknown latest", load: func() error { _, err := reader.LoadLatest(t.Context(), "missing"); return err }},
-		{name: "empty latest ID", load: func() error { _, err := reader.LoadLatest(t.Context(), ""); return err }},
+		{name: "unknown exact", load: func() error {
+			_, err := reader.Load(t.Context(), "missing", 1)
+			return fmt.Errorf("load unknown exact: %w", err)
+		}},
+		{name: "zero version", load: func() error {
+			_, err := reader.Load(t.Context(), "missing", 0)
+			return fmt.Errorf("load zero version: %w", err)
+		}},
+		{name: "empty exact ID", load: func() error {
+			_, err := reader.Load(t.Context(), "", 1)
+			return fmt.Errorf("load empty exact ID: %w", err)
+		}},
+		{name: "unknown latest", load: func() error {
+			_, err := reader.LoadLatest(t.Context(), "missing")
+			return fmt.Errorf("load unknown latest: %w", err)
+		}},
+		{name: "empty latest ID", load: func() error {
+			_, err := reader.LoadLatest(t.Context(), "")
+			return fmt.Errorf("load empty latest ID: %w", err)
+		}},
 	}
 	for _, check := range checks {
 		if err := check.load(); !errors.Is(err, workflow.ErrDefinitionNotFound) {
@@ -416,7 +438,7 @@ func runReaderConcurrencyContract(t *testing.T, factory ReaderFactory) {
 	readErrors := make(chan error, readerCount)
 	var readers sync.WaitGroup
 	readers.Add(readerCount)
-	for index := 0; index < readerCount; index++ {
+	for range readerCount {
 		// Every reader checks both lookup modes after the shared gate opens.
 		go func() {
 			defer readers.Done()
@@ -432,7 +454,7 @@ func runReaderConcurrencyContract(t *testing.T, factory ReaderFactory) {
 				return
 			}
 			if exact.Version != 1 || exact.Nodes[2].ID != "end-v1" || latest.Version != 2 || latest.Nodes[2].ID != "end-v2" {
-				readErrors <- fmt.Errorf("incomplete snapshots: exact %#v latest %#v", exact, latest)
+				readErrors <- fmt.Errorf("%w: exact %#v latest %#v", errIncompleteConcurrentDefinition, exact, latest)
 			}
 		}()
 	}
@@ -463,7 +485,8 @@ func runWriterFailureAtomicityContract(t *testing.T, factory WriterFactory) {
 	// Cancellation is checked before allocation, so an abandoned request cannot reserve the first version.
 	canceled, cancel := context.WithCancel(t.Context())
 	cancel()
-	if _, err := writer.CreateVersion(canceled, contractDefinition("failure-atomicity", "end-canceled")); !errors.Is(err, context.Canceled) {
+	_, err := writer.CreateVersion(canceled, contractDefinition("failure-atomicity", "end-canceled"))
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled CreateVersion() error = %v, want context.Canceled", err)
 	}
 	published, err := writer.CreateVersion(t.Context(), contractDefinition("failure-atomicity", "end-success"))
@@ -520,7 +543,7 @@ func runWriterConcurrencyContract(t *testing.T, factory WriterFactory) {
 	errorsByCall := make(chan error, publicationCount)
 	var publishers sync.WaitGroup
 	publishers.Add(publicationCount)
-	for index := 0; index < publicationCount; index++ {
+	for range publicationCount {
 		// Each publication owns its Definition and waits at the shared gate before crossing the writer seam.
 		go func() {
 			defer publishers.Done()
@@ -546,7 +569,7 @@ func runWriterConcurrencyContract(t *testing.T, factory WriterFactory) {
 	for version := range versions {
 		actual = append(actual, version)
 	}
-	sort.Slice(actual, func(i int, j int) bool { return actual[i] < actual[j] })
+	slices.Sort(actual)
 	if len(actual) != publicationCount {
 		t.Fatalf("concurrent CreateVersion() result count = %d, want %d", len(actual), publicationCount)
 	}
@@ -641,7 +664,8 @@ func assertContractDefinition(t *testing.T, actual *workflow.Definition, id stri
 		t.Fatal("Definition snapshot = nil, want non-nil")
 	}
 	if len(actual.Nodes) != 3 || len(actual.Edges) != 2 || len(actual.Nodes[1].Config) == 0 {
-		t.Fatalf("Definition snapshot shape = %d nodes, %d edges, task config length %d; want 3, 2, and non-empty", len(actual.Nodes), len(actual.Edges), definitionConfigLength(actual))
+		t.Fatalf("Definition snapshot shape = %d nodes, %d edges, task config length %d; want 3, 2, and non-empty",
+			len(actual.Nodes), len(actual.Edges), definitionConfigLength(actual))
 	}
 	// Compare identity and mutable content with literals independent from repository selection logic.
 	if actual.ID != id || actual.Version != version || actual.Nodes[0].ID != "start" ||
@@ -694,14 +718,14 @@ func assertRepositorySnapshot(
 func validateConcurrentSnapshot(definition *workflow.Definition, maxVersion uint64) error {
 	// Nil is never a complete committed repository snapshot.
 	if definition == nil {
-		return errors.New("concurrent Definition snapshot is nil")
+		return errNilConcurrentDefinition
 	}
 	// A complete snapshot has the fixture's full graph and a version committed within the bounded publication set.
 	if definition.ID != "concurrent-lifecycle" || definition.Version == 0 || definition.Version > maxVersion ||
 		len(definition.Nodes) != 3 || len(definition.Edges) != 2 || len(definition.Nodes[1].Config) == 0 ||
 		definition.Nodes[0].ID != "start" || definition.Nodes[1].Config[0] != '{' ||
 		definition.Nodes[2].ID != "end-stable" || definition.Edges[0].To != "task" {
-		return fmt.Errorf("incomplete concurrent Definition snapshot: %#v", definition)
+		return fmt.Errorf("%w: %#v", errIncompleteConcurrentDefinition, definition)
 	}
 	return nil
 }

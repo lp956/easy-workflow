@@ -4,12 +4,40 @@ package approval_test
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 
 	workflow "github.com/lvpeng/easy-workflow"
 	"github.com/lvpeng/easy-workflow/approval"
 )
+
+// TestApprovalRejectsAmbiguousJSONConfig verifies the public validator rejects lossy or multi-value configuration.
+//
+// Each case otherwise contains a usable static approval source, so acceptance would silently discard author intent. Every
+// rejection must retain ErrInvalidConfig for callers that classify definition publication failures by handler contract.
+func TestApprovalRejectsAmbiguousJSONConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		data string
+	}{
+		{name: "unknown field", data: `{"mode":"any","assignees":["reviewer-a"],"rejectedOutome":"rejected"}`},
+		{name: "duplicate field", data: `{"mode":"all","mode":"any","assignees":["reviewer-a"]}`},
+		{name: "trailing value", data: `{"mode":"any","assignees":["reviewer-a"]} {}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := approval.NewHandler().Validate(json.RawMessage(test.data))
+			if !errors.Is(err, approval.ErrInvalidConfig) {
+				t.Fatalf("Validate() error = %v, want ErrInvalidConfig", err)
+			}
+		})
+	}
+}
 
 // TestApprovalPreparedConfigMatchesLegacyExecution verifies one decoded config serves activation and command handling.
 func TestApprovalPreparedConfigMatchesLegacyExecution(t *testing.T) {

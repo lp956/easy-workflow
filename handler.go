@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
+	"github.com/lvpeng/easy-workflow/internal/nilguard"
 )
 
 var (
@@ -41,7 +43,8 @@ type ActivationInput struct {
 
 // CommandInput supplies current node-owned state and tasks for one actor command.
 //
-// Tasks is a defensive copy limited to the current node. Handlers return updated copies in NodeResult;
+// Tasks is a defensive copy containing the current node's complete active and historical task view. Handlers must echo
+// that complete view in NodeResult and may only advance active assignments according to Task's lifecycle contract;
 // mutating this slice cannot change the stored instance unless the engine accepts the result.
 type CommandInput struct {
 	Command
@@ -78,10 +81,13 @@ type PreparedCommandInput struct {
 
 // NodeResult is the only channel through which a handler proposes runtime changes.
 //
-// Waiting results cannot name an Outcome. Activation supplies new active task drafts, command handling supplies the
-// current node's complete task view, and return activation must supply a non-empty fresh task round. Continue results
-// require one declared edge selected by Outcome. Reject results terminate with an empty outcome or require a matching
-// declared edge for a non-empty outcome. State is absent or valid opaque JSON persisted for the active node.
+// Waiting results cannot name an Outcome. Activation supplies new active task drafts, command handling must echo the
+// current node's complete task view, and return activation must supply a non-empty fresh task round. During command
+// handling, historical tasks and active-task identity, ownership, and assignee are immutable; completing an active task
+// requires an outcome, while closing one cannot fabricate an outcome. Waiting must retain active work, whereas Continue
+// and Reject must leave no active tasks. Continue requires one declared edge selected by Outcome. Reject terminates with
+// an empty outcome or requires a matching declared edge for a non-empty outcome. State is absent or valid opaque JSON
+// persisted for the active node.
 type NodeResult struct {
 	Disposition Disposition
 	Outcome     string
@@ -138,11 +144,11 @@ func NewRegistry() *Registry {
 
 // Register binds kind to handler exactly once.
 //
-// kind must be non-empty and handler must be non-nil. Duplicate registration returns ErrHandlerExists so
-// application composition cannot silently replace behavior used by persisted definitions.
+// kind must be non-empty and handler must contain a concrete non-nil implementation. Duplicate registration returns
+// ErrHandlerExists so application composition cannot silently replace behavior used by persisted definitions.
 func (r *Registry) Register(kind string, handler NodeHandler) error {
 	// Registration requires a concrete receiver, stable lookup key, and executable implementation.
-	if r == nil || kind == "" || handler == nil {
+	if r == nil || kind == "" || nilguard.IsNil(handler) {
 		return fmt.Errorf("%w: registry, kind, or handler is empty", ErrInvalidHandler)
 	}
 

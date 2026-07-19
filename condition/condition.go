@@ -16,17 +16,16 @@
 package condition
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math/big"
 	"slices"
 	"strings"
 
 	workflow "github.com/lvpeng/easy-workflow"
+	"github.com/lvpeng/easy-workflow/internal/jsonstrict"
 )
 
 const (
@@ -206,10 +205,7 @@ func activateConfig(config Config, dataJSON json.RawMessage) (workflow.NodeResul
 
 	// Decode business data into fresh storage so evaluation cannot mutate or retain Engine-owned bytes.
 	var data map[string]any
-	if err := rejectDuplicateObjectKeys(dataJSON); err != nil {
-		return workflow.NodeResult{}, fmt.Errorf("%w: %w", ErrInvalidData, err)
-	}
-	if err := decodeJSON(dataJSON, &data); err != nil {
+	if err := jsonstrict.Decode(dataJSON, &data); err != nil {
 		return workflow.NodeResult{}, fmt.Errorf("%w: JSON object required: %w", ErrInvalidData, err)
 	}
 	if data == nil {
@@ -295,128 +291,13 @@ func parseConfig(data json.RawMessage) (Config, error) {
 	return config, nil
 }
 
-// decodeConfig applies duplicate-key and unknown-field rejection before returning typed configuration.
+// decodeConfig applies the shared strict JSON boundary before returning typed configuration.
 //
 // data must contain exactly one Config JSON object. target receives fresh decoded values with numbers preserved
 // as json.Number. Every syntax or schema error is returned to parseConfig for ErrInvalidConfig wrapping.
 func decodeConfig(data []byte, target *Config) error {
-	if err := rejectDuplicateObjectKeys(data); err != nil {
-		return err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
+	if err := jsonstrict.Decode(data, target); err != nil {
 		return fmt.Errorf("%w: decode config: %w", errInvalidJSON, err)
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return fmt.Errorf("%w: multiple values", errInvalidJSON)
-		}
-		return fmt.Errorf("%w: read trailing config data: %w", errInvalidJSON, err)
-	}
-	return nil
-}
-
-// rejectDuplicateObjectKeys scans one JSON value and rejects duplicate names at every object depth.
-//
-// data is parsed only as JSON tokens; strings are never interpreted as code. The scan also rejects trailing
-// values and malformed nesting, and it retains no references after returning.
-func rejectDuplicateObjectKeys(data []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	first, err := decoder.Token()
-	if err != nil {
-		return fmt.Errorf("%w: read first token: %w", errInvalidJSON, err)
-	}
-	if err := scanJSONValue(decoder, first); err != nil {
-		return err
-	}
-	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return fmt.Errorf("%w: multiple values", errInvalidJSON)
-		}
-		return fmt.Errorf("%w: read trailing token: %w", errInvalidJSON, err)
-	}
-	return nil
-}
-
-// scanJSONValue consumes one token-started JSON value while checking object-name uniqueness recursively.
-//
-// decoder must be positioned immediately after first. The function consumes the matching closing delimiter for
-// arrays and objects, performs no allocation proportional to scalar values, and returns syntax or duplicate errors.
-func scanJSONValue(decoder *json.Decoder, first json.Token) error {
-	delimiter, isDelimiter := first.(json.Delim)
-	if !isDelimiter {
-		return nil
-	}
-	switch delimiter {
-	case '{':
-		return scanJSONObject(decoder)
-	case '[':
-		return scanJSONArray(decoder)
-	default:
-		return fmt.Errorf("%w: unexpected closing delimiter", errInvalidJSON)
-	}
-}
-
-// scanJSONObject consumes an opened JSON object and rejects duplicate member names at that depth.
-//
-// decoder must be positioned after '{'. Nested values are delegated back to scanJSONValue, and the matching
-// closing delimiter is consumed before return. The per-object seen set is released with the call.
-func scanJSONObject(decoder *json.Decoder) error {
-	seen := make(map[string]struct{})
-	for decoder.More() {
-		nameToken, err := decoder.Token()
-		if err != nil {
-			return fmt.Errorf("%w: read object member name: %w", errInvalidJSON, err)
-		}
-		name, ok := nameToken.(string)
-		if !ok {
-			return fmt.Errorf("%w: object member name is not a string", errInvalidJSON)
-		}
-		if _, exists := seen[name]; exists {
-			return fmt.Errorf("%w: duplicate object member %q", errInvalidJSON, name)
-		}
-		seen[name] = struct{}{}
-		valueToken, err := decoder.Token()
-		if err != nil {
-			return fmt.Errorf("%w: read object member value: %w", errInvalidJSON, err)
-		}
-		if err := scanJSONValue(decoder, valueToken); err != nil {
-			return err
-		}
-	}
-	closing, err := decoder.Token()
-	if err != nil {
-		return fmt.Errorf("%w: read object closing delimiter: %w", errInvalidJSON, err)
-	}
-	if closing != json.Delim('}') {
-		return fmt.Errorf("%w: object has invalid closing delimiter", errInvalidJSON)
-	}
-	return nil
-}
-
-// scanJSONArray consumes an opened JSON array while recursively checking every contained object.
-//
-// decoder must be positioned after '['. The matching closing delimiter is consumed before return; scalar array
-// members require no allocation, while nested arrays and objects are validated recursively.
-func scanJSONArray(decoder *json.Decoder) error {
-	for decoder.More() {
-		valueToken, err := decoder.Token()
-		if err != nil {
-			return fmt.Errorf("%w: read array member: %w", errInvalidJSON, err)
-		}
-		if err := scanJSONValue(decoder, valueToken); err != nil {
-			return err
-		}
-	}
-	closing, err := decoder.Token()
-	if err != nil {
-		return fmt.Errorf("%w: read array closing delimiter: %w", errInvalidJSON, err)
-	}
-	if closing != json.Delim(']') {
-		return fmt.Errorf("%w: array has invalid closing delimiter", errInvalidJSON)
 	}
 	return nil
 }
@@ -629,25 +510,6 @@ func lookupField(data map[string]any, pointer string) (any, bool) {
 		}
 	}
 	return current, true
-}
-
-// decodeJSON decodes exactly one JSON value while preserving decimal number text.
-//
-// data must contain one complete JSON value. target must be a non-nil pointer accepted by encoding/json.
-// Trailing values and numeric syntax errors are returned; decoded data never aliases the input bytes.
-func decodeJSON(data []byte, target any) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	if err := decoder.Decode(target); err != nil {
-		return fmt.Errorf("%w: decode value: %w", errInvalidJSON, err)
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return fmt.Errorf("%w: multiple values", errInvalidJSON)
-		}
-		return fmt.Errorf("%w: read trailing data: %w", errInvalidJSON, err)
-	}
-	return nil
 }
 
 // validateExpression checks the value shape and operator allow-list for one configured type.

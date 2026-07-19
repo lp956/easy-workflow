@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+
+	"github.com/lvpeng/easy-workflow/internal/jsonstrict"
 )
 
 const (
@@ -156,7 +158,7 @@ func (b *Builder) Build() (*Definition, error) {
 // successful results own their decoded slices and config bytes.
 func ParseDefinition(data []byte) (*Definition, error) {
 	var definition Definition
-	if err := json.Unmarshal(data, &definition); err != nil {
+	if err := jsonstrict.Decode(data, &definition); err != nil {
 		return nil, fmt.Errorf("workflow: parse definition: %w", err)
 	}
 	if err := definition.Validate(); err != nil {

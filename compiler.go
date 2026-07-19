@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+
+	"github.com/lvpeng/easy-workflow/internal/nilguard"
 )
 
 // ErrInvalidNodeConfig identifies configuration rejected by JSON validation or its registered handler.
@@ -69,8 +71,8 @@ func CompileDefinition(definition *Definition, registry *Registry) error {
 
 // compileDefinition validates and freezes one Definition for indexed Engine execution.
 //
-// The returned plan owns all mutable Definition data. registry is read only during compilation; missing
-// handlers and invalid handler configuration fail before a plan is returned.
+// The returned plan owns all mutable Definition data. registry is read only during compilation; missing handlers,
+// invalid handler configuration, and Start selectors that runtime cannot produce fail before a plan is returned.
 func compileDefinition(definition *Definition, registry *Registry) (*compiledDefinition, error) {
 	// Freeze canonical data first so analysis, handler validation, and runtime indexes share one stable snapshot.
 	definitionID := ""
@@ -161,14 +163,24 @@ func compileDefinition(definition *Definition, registry *Registry) (*compiledDef
 			"",
 		)
 	}
+	// The unconditional selector is the sole runtime Start result, so every additional outgoing edge would be dead config.
+	if len(analysis.adjacency[plan.startID]) != 1 {
+		return nil, fmt.Errorf(
+			"%w: definition %q start node %q has %d outgoing routes; want one unconditional route",
+			ErrInvalidDefinition,
+			plan.definition.ID,
+			plan.startID,
+			len(analysis.adjacency[plan.startID]),
+		)
+	}
 	return plan, nil
 }
 
 // analyzeDefinition derives and validates every structural graph index in one pass over nodes and one pass over edges.
 //
-// definition must contain a stable ID, exactly one start, at least one end, unique node IDs, and deterministic
-// valid edge references. The returned analysis owns all derived maps and slices; node positions refer to the supplied
-// canonical order without retaining definition. Errors wrap ErrInvalidDefinition and leave no reusable partial result.
+// definition must contain a stable ID, exactly one start, at least one end, unique node IDs, and deterministic valid edge
+// references. The returned analysis owns all derived maps and slices; node positions refer to the supplied canonical order
+// without retaining definition. Complete compilation separately enforces the executable Start selector contract.
 func analyzeDefinition(definition *Definition) (*definitionAnalysis, error) {
 	// Reject incomplete identity before deriving allocation sizes or indexing caller-owned graph data.
 	if definition == nil {
@@ -188,66 +200,11 @@ func analyzeDefinition(definition *Definition) (*definitionAnalysis, error) {
 		predecessors: make(map[string][]string, len(definition.Nodes)),
 		indegree:     make(map[string]int, len(definition.Nodes)),
 	}
-	startCount := 0
-	for index, node := range definition.Nodes {
-		// Both fields participate in persistence and runtime lookup, so neither has a useful zero value.
-		if node.ID == "" || node.Kind == "" {
-			return nil, fmt.Errorf("%w: node id and kind must be non-empty", ErrInvalidDefinition)
-		}
-		// Duplicate IDs would make execution depend on declaration order.
-		if _, exists := analysis.nodes[node.ID]; exists {
-			return nil, fmt.Errorf("%w: duplicate node %q", ErrInvalidDefinition, node.ID)
-		}
-		analysis.nodes[node.ID] = index
-		analysis.indegree[node.ID] = 0
-		switch node.Kind {
-		case KindStart:
-			startCount++
-			analysis.startID = node.ID
-		case KindEnd:
-			analysis.endIDs = append(analysis.endIDs, node.ID)
-		}
+	if err := analysis.indexNodes(definition); err != nil {
+		return nil, err
 	}
-	// Exactly one start keeps startup routing deterministic.
-	if startCount != 1 {
-		return nil, fmt.Errorf("%w: expected one start node, got %d", ErrInvalidDefinition, startCount)
-	}
-	// At least one end is required for every validated branch to terminate successfully.
-	if len(analysis.endIDs) == 0 {
-		return nil, fmt.Errorf("%w: expected at least one end node", ErrInvalidDefinition)
-	}
-
-	// Resolve edges and populate all forward, reverse, routing, and topological data in the same pass.
-	for _, edge := range definition.Edges {
-		sourceIndex, sourceExists := analysis.nodes[edge.From]
-		// Every source must resolve before its kind can be checked safely.
-		if !sourceExists {
-			return nil, fmt.Errorf("%w: edge source %q does not exist", ErrInvalidDefinition, edge.From)
-		}
-		// Every target must be part of the same canonical Definition snapshot.
-		if _, targetExists := analysis.nodes[edge.To]; !targetExists {
-			return nil, fmt.Errorf("%w: edge target %q does not exist", ErrInvalidDefinition, edge.To)
-		}
-		// Terminal nodes cannot hide executable successors behind serialized edges.
-		if definition.Nodes[sourceIndex].Kind == KindEnd {
-			return nil, fmt.Errorf("%w: end node %q has an outgoing edge", ErrInvalidDefinition, edge.From)
-		}
-		selector := edgeSelector{source: edge.From, outcome: edge.Outcome}
-		// Duplicate selectors would make target choice depend on declaration order.
-		if _, exists := analysis.routes[selector]; exists {
-			return nil, fmt.Errorf(
-				"%w: %w: definition %q node %q outcome %q selects multiple targets",
-				ErrInvalidDefinition,
-				ErrAmbiguousRoute,
-				definition.ID,
-				edge.From,
-				edge.Outcome,
-			)
-		}
-		analysis.routes[selector] = edge.To
-		analysis.adjacency[edge.From] = append(analysis.adjacency[edge.From], edge.To)
-		analysis.predecessors[edge.To] = append(analysis.predecessors[edge.To], edge.From)
-		analysis.indegree[edge.To]++
+	if err := analysis.indexEdges(definition); err != nil {
+		return nil, err
 	}
 
 	// Reuse the derived graph for every invariant so no validation pass reconstructs edge relationships.
@@ -264,6 +221,83 @@ func analyzeDefinition(definition *Definition) (*definitionAnalysis, error) {
 		return nil, err
 	}
 	return analysis, nil
+}
+
+// indexNodes validates canonical node identity and records control-node and topological seeds in one pass.
+//
+// definition must be non-nil and a must be freshly allocated with empty indexes. The method records canonical slice
+// positions, requires exactly one Start and at least one End, and returns ErrInvalidDefinition without retaining node data.
+func (a *definitionAnalysis) indexNodes(definition *Definition) error {
+	startCount := 0
+	for index, node := range definition.Nodes {
+		// Both fields participate in persistence and runtime lookup, so neither has a useful zero value.
+		if node.ID == "" || node.Kind == "" {
+			return fmt.Errorf("%w: node id and kind must be non-empty", ErrInvalidDefinition)
+		}
+		// Duplicate IDs would make execution depend on declaration order.
+		if _, exists := a.nodes[node.ID]; exists {
+			return fmt.Errorf("%w: duplicate node %q", ErrInvalidDefinition, node.ID)
+		}
+		a.nodes[node.ID] = index
+		a.indegree[node.ID] = 0
+		switch node.Kind {
+		case KindStart:
+			startCount++
+			a.startID = node.ID
+		case KindEnd:
+			a.endIDs = append(a.endIDs, node.ID)
+		default:
+			// Business node kinds are validated through Registry during complete compilation.
+		}
+	}
+	// Exactly one start keeps startup routing deterministic.
+	if startCount != 1 {
+		return fmt.Errorf("%w: expected one start node, got %d", ErrInvalidDefinition, startCount)
+	}
+	// At least one end is required for every validated branch to terminate successfully.
+	if len(a.endIDs) == 0 {
+		return fmt.Errorf("%w: expected at least one end node", ErrInvalidDefinition)
+	}
+	return nil
+}
+
+// indexEdges validates canonical references and derives routing, traversal, and topological indexes in one pass.
+//
+// definition nodes must already be indexed in a. Every source and target must resolve, End nodes cannot have successors,
+// and each source-outcome selector must be unique. Errors wrap ErrInvalidDefinition and no caller-owned data is mutated.
+func (a *definitionAnalysis) indexEdges(definition *Definition) error {
+	for _, edge := range definition.Edges {
+		sourceIndex, sourceExists := a.nodes[edge.From]
+		// Every source must resolve before its kind can be checked safely.
+		if !sourceExists {
+			return fmt.Errorf("%w: edge source %q does not exist", ErrInvalidDefinition, edge.From)
+		}
+		// Every target must be part of the same canonical Definition snapshot.
+		if _, targetExists := a.nodes[edge.To]; !targetExists {
+			return fmt.Errorf("%w: edge target %q does not exist", ErrInvalidDefinition, edge.To)
+		}
+		// Terminal nodes cannot hide executable successors behind serialized edges.
+		if definition.Nodes[sourceIndex].Kind == KindEnd {
+			return fmt.Errorf("%w: end node %q has an outgoing edge", ErrInvalidDefinition, edge.From)
+		}
+		selector := edgeSelector{source: edge.From, outcome: edge.Outcome}
+		// Duplicate selectors would make target choice depend on declaration order.
+		if _, exists := a.routes[selector]; exists {
+			return fmt.Errorf(
+				"%w: %w: definition %q node %q outcome %q selects multiple targets",
+				ErrInvalidDefinition,
+				ErrAmbiguousRoute,
+				definition.ID,
+				edge.From,
+				edge.Outcome,
+			)
+		}
+		a.routes[selector] = edge.To
+		a.adjacency[edge.From] = append(a.adjacency[edge.From], edge.To)
+		a.predecessors[edge.To] = append(a.predecessors[edge.To], edge.From)
+		a.indegree[edge.To]++
+	}
+	return nil
 }
 
 // validateAcyclic uses the analyzed indegree and adjacency data to reject cycles without recursive stack growth.
@@ -379,7 +413,7 @@ func (p *compiledDefinition) node(id string) (*NodeDefinition, error) {
 // be used only during the enclosing Engine operation. Missing or control-node handlers return ErrHandlerNotFound.
 func (p *compiledDefinition) preparedHandler(id string) (PreparedNodeHandler, error) {
 	compiled, exists := p.nodes[id]
-	if !exists || compiled.handler == nil {
+	if !exists || nilguard.IsNil(compiled.handler) {
 		return nil, fmt.Errorf("%w: %q", ErrHandlerNotFound, id)
 	}
 	return compiled.handler, nil

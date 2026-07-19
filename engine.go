@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+
+	"github.com/lvpeng/easy-workflow/internal/nilguard"
 )
 
 var (
@@ -76,7 +78,7 @@ func NewEngine(store Store, registry *Registry) *Engine {
 // before persistence and may observe context cancellation. The returned snapshot is detached from Store.
 func (e *Engine) Start(ctx context.Context, definition *Definition, request StartRequest) (*Instance, error) {
 	// Required collaborators must exist before validation can resolve handlers or persist the new aggregate.
-	if e == nil || e.store == nil || e.registry == nil {
+	if e == nil || nilguard.IsNil(e.store) || e.registry == nil {
 		return nil, fmt.Errorf("%w: start dependencies are nil", ErrInvalidEngine)
 	}
 	// External identity and JSON syntax are checked before potentially expensive Definition compilation.
@@ -119,7 +121,7 @@ func (e *Engine) StartPublished(
 	request StartRequest,
 ) (*Instance, error) {
 	// Exact-version startup requires a complete repository identity and never infers missing values.
-	if definitions == nil || definitionID == "" || version == 0 {
+	if nilguard.IsNil(definitions) || definitionID == "" || version == 0 {
 		return nil, fmt.Errorf("%w: definition reader or identity is invalid", ErrInvalidStartRequest)
 	}
 
@@ -206,10 +208,10 @@ func (e *Engine) Withdraw(
 	policy WithdrawalPolicy,
 ) (*Instance, error) {
 	// Withdrawal needs persistence and complete trusted identities before any durable state is loaded.
-	if e == nil || e.store == nil {
+	if e == nil || nilguard.IsNil(e.store) {
 		return nil, fmt.Errorf("%w: withdraw store is nil", ErrInvalidEngine)
 	}
-	if request.InstanceID == "" || request.ActorID == "" || policy == nil {
+	if request.InstanceID == "" || request.ActorID == "" || nilguard.IsNil(policy) {
 		return nil, fmt.Errorf("%w: instance, actor, or policy is empty", ErrInvalidWithdrawRequest)
 	}
 
@@ -247,11 +249,11 @@ func (e *Engine) Return(
 	policy ReturnPolicy,
 ) (*Instance, error) {
 	// Return needs the registry to validate and activate the explicit target through its registered handler.
-	if e == nil || e.store == nil || e.registry == nil {
+	if e == nil || nilguard.IsNil(e.store) || e.registry == nil {
 		return nil, fmt.Errorf("%w: return dependencies are nil", ErrInvalidEngine)
 	}
 	if request.InstanceID == "" || request.ActorID == "" || request.TargetNodeID == "" ||
-		strings.TrimSpace(request.Reason) == "" || policy == nil {
+		strings.TrimSpace(request.Reason) == "" || nilguard.IsNil(policy) {
 		return nil, fmt.Errorf("%w: instance, actor, target, reason, or policy is empty", ErrInvalidReturnRequest)
 	}
 
@@ -290,11 +292,11 @@ func (e *Engine) Transfer(
 	policy TransferPolicy,
 ) (*Instance, error) {
 	// Transfer needs persistence and complete trusted boundary input before loading durable state.
-	if e == nil || e.store == nil {
+	if e == nil || nilguard.IsNil(e.store) {
 		return nil, fmt.Errorf("%w: transfer store is nil", ErrInvalidEngine)
 	}
 	if request.InstanceID == "" || request.TaskID == "" || request.ActorID == "" || request.NewAssignee == "" ||
-		strings.TrimSpace(request.Reason) == "" || policy == nil {
+		strings.TrimSpace(request.Reason) == "" || nilguard.IsNil(policy) {
 		return nil, fmt.Errorf("%w: instance, task, actor, assignee, reason, or policy is empty", ErrInvalidTransferRequest)
 	}
 
@@ -420,7 +422,7 @@ func (e *Engine) executeInstanceCommand(
 	command instanceCommand,
 ) (*Instance, error) {
 	// Internal command construction must be complete before storage or callbacks can run.
-	if e == nil || e.store == nil || command.instanceID == "" || command.nonRunningError == nil ||
+	if e == nil || nilguard.IsNil(e.store) || command.instanceID == "" || command.nonRunningError == nil ||
 		command.prepare == nil || command.audit == nil || command.transition == nil {
 		return nil, fmt.Errorf("%w: instance command is incomplete", ErrInvalidEngine)
 	}
@@ -473,7 +475,7 @@ func hasEnteredNode(audit []AuditRecord, nodeID string) bool {
 // I/O and returns ErrInvalidEngine or ErrInvalidCommand so callers can classify setup and request failures.
 func (e *Engine) validateCommand(command Command) error {
 	// Missing collaborators make every command unsafe regardless of its input fields.
-	if e == nil || e.store == nil || e.registry == nil {
+	if e == nil || nilguard.IsNil(e.store) || e.registry == nil {
 		return fmt.Errorf("%w: handle dependencies are nil", ErrInvalidEngine)
 	}
 	// All four identities jointly bind the command to one task, actor, and handler operation.

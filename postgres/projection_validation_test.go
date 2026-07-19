@@ -16,6 +16,15 @@ import (
 	"github.com/lvpeng/easy-workflow/postgres"
 )
 
+// wrapProjectionQueryError adds the public query family to a non-nil adapter error while preserving nil success.
+// operation is a stable test label and err is the exact public query result; wrapped causes remain available to errors.Is.
+func wrapProjectionQueryError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s projection query: %w", operation, err)
+}
+
 // TestProjectionWorklistReturnsEmptyPageForEmptyScope verifies deny-all scope needs no usable database connection.
 //
 // t owns a closed pool sentinel and records any acquisition, error, nil slice, item, or cursor as a test failure.
@@ -99,15 +108,15 @@ func TestProjectionQueryFamiliesEnforcePageLimits(t *testing.T) {
 	}{
 		{name: "worklist", call: func(query postgres.ActorQuery) error {
 			_, err := projection.Worklist(t.Context(), query)
-			return err
+			return wrapProjectionQueryError("worklist", err)
 		}},
 		{name: "participated", call: func(query postgres.ActorQuery) error {
 			_, err := projection.Participated(t.Context(), query)
-			return err
+			return wrapProjectionQueryError("participated", err)
 		}},
 		{name: "initiated", call: func(query postgres.ActorQuery) error {
 			_, err := projection.Initiated(t.Context(), query)
-			return err
+			return wrapProjectionQueryError("initiated", err)
 		}},
 	}
 
@@ -177,7 +186,7 @@ func TestProjectionQueryFamiliesRejectCrossFamilyCursors(t *testing.T) {
 				Scope:   emptyScope,
 				Page:    postgres.PageRequest{After: instanceCursor},
 			})
-			return queryErr
+			return wrapProjectionQueryError("worklist", queryErr)
 		},
 		"participated": func() error {
 			_, queryErr := projection.Participated(t.Context(), postgres.ActorQuery{
@@ -185,7 +194,7 @@ func TestProjectionQueryFamiliesRejectCrossFamilyCursors(t *testing.T) {
 				Scope:   emptyScope,
 				Page:    postgres.PageRequest{After: instanceCursor},
 			})
-			return queryErr
+			return wrapProjectionQueryError("participated", queryErr)
 		},
 	} {
 		// This callback verifies one task-family method rejects the shared instance-only cursor.

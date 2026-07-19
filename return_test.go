@@ -489,6 +489,10 @@ func TestEngineReturnValidatesBoundaryInput(t *testing.T) {
 			name: "nil policy", engine: workflow.NewEngine(workflow.NewMemoryStore(), workflow.NewRegistry()),
 			request: validRequest, wantErr: workflow.ErrInvalidReturnRequest,
 		},
+		{
+			name: "typed nil policy", engine: workflow.NewEngine(workflow.NewMemoryStore(), workflow.NewRegistry()),
+			request: validRequest, policy: returnPolicyFunc(nil), wantErr: workflow.ErrInvalidReturnRequest,
+		},
 	}
 
 	for _, tt := range tests {

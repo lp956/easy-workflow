@@ -225,6 +225,13 @@ func TestEngineWithdrawValidatesBoundaryInput(t *testing.T) {
 			request: workflow.WithdrawRequest{InstanceID: "instance", ActorID: "actor"},
 			wantErr: workflow.ErrInvalidWithdrawRequest,
 		},
+		{
+			name:    "typed nil policy",
+			engine:  workflow.NewEngine(workflow.NewMemoryStore(), nil),
+			request: workflow.WithdrawRequest{InstanceID: "instance", ActorID: "actor"},
+			policy:  withdrawalPolicyFunc(nil),
+			wantErr: workflow.ErrInvalidWithdrawRequest,
+		},
 	}
 
 	for _, tt := range tests {

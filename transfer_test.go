@@ -430,6 +430,7 @@ func TestEngineTransferValidatesBoundaryInput(t *testing.T) {
 		{name: "empty target", engine: workflow.NewEngine(workflow.NewMemoryStore(), nil), request: workflow.TransferRequest{InstanceID: "instance", TaskID: "task", ActorID: "operator", Reason: "coverage"}, policy: policy, wantErr: workflow.ErrInvalidTransferRequest},
 		{name: "blank reason", engine: workflow.NewEngine(workflow.NewMemoryStore(), nil), request: workflow.TransferRequest{InstanceID: "instance", TaskID: "task", ActorID: "operator", NewAssignee: "reviewer", Reason: "  "}, policy: policy, wantErr: workflow.ErrInvalidTransferRequest},
 		{name: "nil policy", engine: workflow.NewEngine(workflow.NewMemoryStore(), nil), request: validRequest, wantErr: workflow.ErrInvalidTransferRequest},
+		{name: "typed nil policy", engine: workflow.NewEngine(workflow.NewMemoryStore(), nil), request: validRequest, policy: transferPolicyFunc(nil), wantErr: workflow.ErrInvalidTransferRequest},
 	}
 
 	for _, tt := range tests {

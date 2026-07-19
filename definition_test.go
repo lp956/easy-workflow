@@ -53,6 +53,44 @@ func TestBuilderJSONRoundTrip(t *testing.T) {
 	}
 }
 
+// TestParseDefinitionRejectsAmbiguousJSON verifies web-authored definitions use a closed, single-value schema.
+//
+// Every fixture would otherwise decode into a structurally valid start-to-end graph after unknown or duplicate data was
+// discarded. ParseDefinition must reject the bytes before those silent rewrites acquire canonical workflow meaning.
+func TestParseDefinitionRejectsAmbiguousJSON(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		data string
+	}{
+		{
+			name: "unknown edge field",
+			data: `{"id":"strict-unknown","nodes":[{"id":"start","kind":"start"},{"id":"end","kind":"end"}],` +
+				`"edges":[{"from":"start","to":"end","outcome":"","outcomee":"never"}]}`,
+		},
+		{
+			name: "duplicate root field",
+			data: `{"id":"discarded","id":"strict-duplicate","nodes":[{"id":"start","kind":"start"},` +
+				`{"id":"end","kind":"end"}],"edges":[{"from":"start","to":"end","outcome":""}]}`,
+		},
+		{
+			name: "trailing value",
+			data: `{"id":"strict-trailing","nodes":[{"id":"start","kind":"start"},{"id":"end","kind":"end"}],` +
+				`"edges":[{"from":"start","to":"end","outcome":""}]} {}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if _, err := workflow.ParseDefinition([]byte(test.data)); err == nil {
+				t.Fatal("ParseDefinition() error = nil, want strict JSON rejection")
+			}
+		})
+	}
+}
+
 // TestBuilderRejectsCycle verifies that definition-time validation enforces the agreed DAG boundary.
 func TestBuilderRejectsCycle(t *testing.T) {
 	t.Parallel()

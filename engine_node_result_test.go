@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"slices"
 	"sync"
@@ -20,6 +21,11 @@ const taskSetHandlerKind = "task-set-result-test"
 // malformedResultHandlerKind is the isolated extension key used to exercise stage-specific NodeResult validation.
 const malformedResultHandlerKind = "malformed-node-result-test"
 
+var (
+	// errInvalidReturnRole classifies malformed role configuration supplied to the return-result test handler.
+	errInvalidReturnRole = errors.New("test handler: invalid role")
+)
+
 // taskSetViolation selects one malformed complete task view returned by the test handler.
 type taskSetViolation string
 
@@ -30,6 +36,16 @@ const (
 	violationOmittedTask taskSetViolation = "omitted-task"
 	// violationOtherNodeTask proposes a task value owned by a different node.
 	violationOtherNodeTask taskSetViolation = "other-node-task"
+	// violationMutatedHistoricalTask rewrites one completed task from an earlier round at the current node.
+	violationMutatedHistoricalTask taskSetViolation = "mutated-historical-task"
+	// violationReassignedActiveTask changes an active task owner without using Engine.Transfer.
+	violationReassignedActiveTask taskSetViolation = "reassigned-active-task"
+	// violationWaitingWithoutActiveTask leaves the instance waiting after closing its final actionable task.
+	violationWaitingWithoutActiveTask taskSetViolation = "waiting-without-active-task"
+	// violationContinueWithActiveTask routes away while retaining an actionable task at the old node.
+	violationContinueWithActiveTask taskSetViolation = "continue-with-active-task"
+	// violationRejectWithActiveTask rejects while retaining an actionable task at the terminal node.
+	violationRejectWithActiveTask taskSetViolation = "reject-with-active-task"
 )
 
 // malformedResultViolation selects one invalid cross-field combination returned at a public handler seam.
@@ -116,10 +132,10 @@ type returnResultHandler struct {
 func (*returnResultHandler) Validate(config json.RawMessage) error {
 	var role string
 	if err := json.Unmarshal(config, &role); err != nil {
-		return err
+		return fmt.Errorf("test handler decode return role: %w", err)
 	}
 	if role != "target" && role != "source" {
-		return errors.New("test handler: invalid role")
+		return errInvalidReturnRole
 	}
 	return nil
 }
@@ -128,7 +144,7 @@ func (*returnResultHandler) Validate(config json.RawMessage) error {
 func (h *returnResultHandler) Activate(_ context.Context, input workflow.ActivationInput) (workflow.NodeResult, error) {
 	var role string
 	if err := json.Unmarshal(input.Config, &role); err != nil {
-		return workflow.NodeResult{}, err
+		return workflow.NodeResult{}, fmt.Errorf("test handler decode activation role: %w", err)
 	}
 	if role == "target" {
 		h.mu.Lock()
@@ -181,12 +197,14 @@ func (taskSetResultHandler) Activate(context.Context, workflow.ActivationInput) 
 	}, nil
 }
 
-// Handle returns a detached current task view containing the selected ownership or completeness violation.
+// Handle returns a detached current task view containing the selected ownership, lifecycle, or completeness violation.
 //
-// input must contain the activation task. The method returns no error so Engine remains the observable classifier,
-// retains no caller data, performs no external I/O, and is safe for concurrent calls.
+// input must contain the activation task and may contain a seeded historical task. The method returns no error so Engine
+// remains the observable classifier, retains no caller data, performs no external I/O, and is safe for concurrent calls.
 func (h taskSetResultHandler) Handle(_ context.Context, input workflow.CommandInput) (workflow.NodeResult, error) {
 	tasks := append([]workflow.Task(nil), input.Tasks...)
+	disposition := workflow.DispositionWaiting
+	outcome := ""
 	switch h.violation {
 	case violationUnknownTask:
 		tasks = append(tasks, workflow.Task{
@@ -204,8 +222,23 @@ func (h taskSetResultHandler) Handle(_ context.Context, input workflow.CommandIn
 			Assignee: "owner-b",
 			Status:   workflow.TaskStatusActive,
 		})
+	case violationMutatedHistoricalTask:
+		for index := range tasks {
+			if tasks[index].ID == "historical-task" {
+				tasks[index].Outcome = "rewritten"
+			}
+		}
+	case violationReassignedActiveTask:
+		tasks[0].Assignee = "owner-b"
+	case violationWaitingWithoutActiveTask:
+		tasks[0].Status = workflow.TaskStatusClosed
+	case violationContinueWithActiveTask:
+		disposition = workflow.DispositionContinue
+		outcome = "accepted"
+	case violationRejectWithActiveTask:
+		disposition = workflow.DispositionReject
 	}
-	return workflow.NodeResult{Disposition: workflow.DispositionWaiting, Tasks: tasks}, nil
+	return workflow.NodeResult{Disposition: disposition, Outcome: outcome, Tasks: tasks}, nil
 }
 
 // startTaskSetResultInstance builds and starts one isolated Engine scenario for task-set validation.
@@ -244,25 +277,35 @@ func startTaskSetResultInstance(
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
-	if violation == violationOtherNodeTask {
-		// Seed an existing task for the declared non-current node through Store's public snapshot contract.
+	if violation == violationOtherNodeTask || violation == violationMutatedHistoricalTask {
+		// Seed the exact durable history needed by cross-node ownership or same-node immutability scenarios.
 		expectedVersion := instance.Version
-		instance.Tasks = append(instance.Tasks, workflow.Task{
-			ID:       "other-node-task",
-			NodeID:   "other-node",
-			Assignee: "historical-owner",
-			Status:   workflow.TaskStatusCompleted,
-			Outcome:  "accepted",
-		})
+		if violation == violationOtherNodeTask {
+			instance.Tasks = append(instance.Tasks, workflow.Task{
+				ID:       "other-node-task",
+				NodeID:   "other-node",
+				Assignee: "historical-owner",
+				Status:   workflow.TaskStatusCompleted,
+				Outcome:  "accepted",
+			})
+		} else {
+			instance.Tasks = append(instance.Tasks, workflow.Task{
+				ID:       "historical-task",
+				NodeID:   "decision",
+				Assignee: "historical-owner",
+				Status:   workflow.TaskStatusCompleted,
+				Outcome:  "accepted",
+			})
+		}
 		instance.Version++
 		if err := store.Save(t.Context(), instance, expectedVersion); err != nil {
-			t.Fatalf("Save(other-node task) error = %v", err)
+			t.Fatalf("Save(seeded task history) error = %v", err)
 		}
 	}
 	return engine, store, instance
 }
 
-// TestEngineRejectsMalformedTaskDecisionSets verifies ownership and completeness without persisting partial facts.
+// TestEngineRejectsMalformedTaskDecisionSets verifies task ownership, history, and lifecycle invariants atomically.
 func TestEngineRejectsMalformedTaskDecisionSets(t *testing.T) {
 	t.Parallel()
 
@@ -273,6 +316,11 @@ func TestEngineRejectsMalformedTaskDecisionSets(t *testing.T) {
 		{name: "unknown task", violation: violationUnknownTask},
 		{name: "omitted current task", violation: violationOmittedTask},
 		{name: "task owned by another node", violation: violationOtherNodeTask},
+		{name: "mutated historical task", violation: violationMutatedHistoricalTask},
+		{name: "reassigned active task", violation: violationReassignedActiveTask},
+		{name: "waiting without active task", violation: violationWaitingWithoutActiveTask},
+		{name: "continue with active task", violation: violationContinueWithActiveTask},
+		{name: "reject with active task", violation: violationRejectWithActiveTask},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

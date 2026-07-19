@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"maps"
 	"reflect"
 	"slices"
 	"sync"
@@ -24,6 +26,14 @@ const (
 var (
 	// errLegacyPreparedPath identifies an accidental fallback from a prepared execution plan to legacy handler methods.
 	errLegacyPreparedPath = errors.New("test handler: legacy path called")
+	// errUnsupportedPreparedRole classifies configuration outside the prepared probe's two executable roles.
+	errUnsupportedPreparedRole = errors.New("test handler: unsupported prepared role")
+	// errUnexpectedLegacyConfig classifies canonical bytes changed before legacy validation.
+	errUnexpectedLegacyConfig = errors.New("test handler: unexpected legacy config")
+	// errMissingLegacyActivationConfig classifies canonical bytes omitted or changed before legacy activation.
+	errMissingLegacyActivationConfig = errors.New("test handler: missing legacy activation config")
+	// errMissingLegacyCommandConfig classifies canonical bytes omitted or changed before legacy command handling.
+	errMissingLegacyCommandConfig = errors.New("test handler: missing legacy command config")
 )
 
 // preparedProbeHandler records compilation and prepared-execution calls without retaining Engine input.
@@ -49,6 +59,31 @@ type preparedProbeExecution struct {
 	owner *preparedProbeHandler
 	// role is the decoded handler configuration reused by every call in the compiled plan.
 	role string
+}
+
+// typedNilPreparedProbeHandler returns a typed-nil executor to exercise the public compilation boundary.
+// It is stateless, performs no I/O, and its legacy methods must never execute after PrepareConfig is selected.
+type typedNilPreparedProbeHandler struct{}
+
+// Validate accepts test configuration; the preparer interface replaces this legacy path during compilation.
+func (typedNilPreparedProbeHandler) Validate(json.RawMessage) error {
+	return nil
+}
+
+// Activate reports an unreachable legacy call if compilation incorrectly bypasses PrepareConfig.
+func (typedNilPreparedProbeHandler) Activate(context.Context, workflow.ActivationInput) (workflow.NodeResult, error) {
+	return workflow.NodeResult{}, errLegacyPreparedPath
+}
+
+// Handle reports an unreachable legacy call if compilation incorrectly constructs a compatibility executor.
+func (typedNilPreparedProbeHandler) Handle(context.Context, workflow.CommandInput) (workflow.NodeResult, error) {
+	return workflow.NodeResult{}, errLegacyPreparedPath
+}
+
+// PrepareConfig returns a typed-nil PreparedNodeHandler without retaining the supplied canonical bytes.
+func (typedNilPreparedProbeHandler) PrepareConfig(json.RawMessage) (workflow.PreparedNodeHandler, error) {
+	var prepared *preparedProbeExecution
+	return prepared, nil
 }
 
 // Validate fails deliberately because a ConfigPreparer must replace legacy validation with one preparation call.
@@ -82,10 +117,10 @@ func (h *preparedProbeHandler) Handle(context.Context, workflow.CommandInput) (w
 func (h *preparedProbeHandler) PrepareConfig(config json.RawMessage) (workflow.PreparedNodeHandler, error) {
 	var role string
 	if err := json.Unmarshal(config, &role); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("test prepared handler decode role: %w", err)
 	}
 	if role != "first" && role != "second" {
-		return nil, errors.New("test handler: unsupported prepared role")
+		return nil, errUnsupportedPreparedRole
 	}
 	h.mu.Lock()
 	if h.prepares == nil {
@@ -171,7 +206,7 @@ type legacyProbeHandler struct {
 // Validate accepts only the canonical legacy probe string and records one compilation call.
 func (h *legacyProbeHandler) Validate(config json.RawMessage) error {
 	if string(config) != `"legacy"` {
-		return errors.New("test handler: unexpected legacy config")
+		return errUnexpectedLegacyConfig
 	}
 	h.mu.Lock()
 	h.validations++
@@ -182,7 +217,7 @@ func (h *legacyProbeHandler) Validate(config json.RawMessage) error {
 // Activate verifies raw config delivery and creates one valid waiting assignment.
 func (h *legacyProbeHandler) Activate(_ context.Context, input workflow.ActivationInput) (workflow.NodeResult, error) {
 	if string(input.Config) != `"legacy"` {
-		return workflow.NodeResult{}, errors.New("test handler: missing legacy activation config")
+		return workflow.NodeResult{}, errMissingLegacyActivationConfig
 	}
 	h.mu.Lock()
 	h.activations++
@@ -196,7 +231,7 @@ func (h *legacyProbeHandler) Activate(_ context.Context, input workflow.Activati
 // Handle verifies raw config delivery, completes the selected task, and follows the declared outcome.
 func (h *legacyProbeHandler) Handle(_ context.Context, input workflow.CommandInput) (workflow.NodeResult, error) {
 	if string(input.Config) != `"legacy"` {
-		return workflow.NodeResult{}, errors.New("test handler: missing legacy command config")
+		return workflow.NodeResult{}, errMissingLegacyCommandConfig
 	}
 	h.mu.Lock()
 	h.handles++
@@ -224,10 +259,53 @@ func cloneIntMap(source map[string]int) map[string]int {
 		return nil
 	}
 	result := make(map[string]int, len(source))
-	for key, value := range source {
-		result[key] = value
-	}
+	maps.Copy(result, source)
 	return result
+}
+
+// TestHandlerBoundariesRejectTypedNilImplementations verifies interface wrappers cannot bypass nil dependency checks.
+//
+// Registration and prepared-executor construction must return their documented classification errors without invoking a
+// method on either typed-nil value. The table uses stateless probes and performs no external I/O.
+func TestHandlerBoundariesRejectTypedNilImplementations(t *testing.T) {
+	t.Parallel()
+
+	t.Run("registry handler", func(t *testing.T) {
+		t.Parallel()
+
+		var handler *legacyProbeHandler
+		err := workflow.NewRegistry().Register("typed-nil-handler", handler)
+		if !errors.Is(err, workflow.ErrInvalidHandler) {
+			t.Fatalf("Register() error = %v, want ErrInvalidHandler", err)
+		}
+	})
+
+	t.Run("prepared executor", func(t *testing.T) {
+		t.Parallel()
+
+		registry := workflow.NewRegistry()
+		if err := registry.Register("typed-nil-prepared", typedNilPreparedProbeHandler{}); err != nil {
+			t.Fatalf("Register() error = %v", err)
+		}
+		builder := workflow.NewBuilder("typed-nil-prepared")
+		builder.Start("start")
+		builder.Node("task", "typed-nil-prepared", nil)
+		builder.End("end")
+		builder.Connect("start", "task", "")
+		builder.Connect("task", "end", "done")
+		definition, err := builder.Build()
+		if err != nil {
+			t.Fatalf("Build() error = %v", err)
+		}
+
+		_, err = workflow.NewEngine(workflow.NewMemoryStore(), registry).Start(t.Context(), definition, workflow.StartRequest{
+			ID:        "typed-nil-prepared-1",
+			Initiator: "requester-a",
+		})
+		if !errors.Is(err, workflow.ErrInvalidHandler) {
+			t.Fatalf("Start() error = %v, want ErrInvalidHandler", err)
+		}
+	})
 }
 
 // TestEnginePreparesHandlerConfigOncePerExecutablePlan verifies Start and Handle each build one reusable prepared plan.

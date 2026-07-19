@@ -39,6 +39,7 @@ type instanceProjectionKeyset struct {
 // instanceProjectionQuery is one fully prepared Initiated request ready for parameterized SQL execution.
 type instanceProjectionQuery struct {
 	projectionQueryBoundary
+
 	// after is nil for the first page or a validated complete instance keyset for exclusive continuation.
 	after *instanceProjectionKeyset
 }

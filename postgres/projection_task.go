@@ -65,6 +65,7 @@ type taskProjectionKeyset struct {
 // taskProjectionQuery is one fully prepared task-family request ready for parameterized SQL execution.
 type taskProjectionQuery struct {
 	projectionQueryBoundary
+
 	// after is nil for the first page or a validated complete task keyset for exclusive continuation.
 	after *taskProjectionKeyset
 }

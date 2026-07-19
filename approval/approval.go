@@ -10,6 +10,8 @@ import (
 	"slices"
 
 	workflow "github.com/lvpeng/easy-workflow"
+	"github.com/lvpeng/easy-workflow/internal/jsonstrict"
+	"github.com/lvpeng/easy-workflow/internal/nilguard"
 )
 
 const (
@@ -192,7 +194,7 @@ func (h *Handler) activateConfig(
 	assignees := config.Assignees
 	if config.Policy != nil {
 		// Dynamic policies never fall back to a global or implicit organization directory.
-		if h == nil || h.organization == nil {
+		if h == nil || nilguard.IsNil(h.organization) {
 			return workflow.NodeResult{}, fmt.Errorf("%w: %w", ErrInvalidConfig, ErrOrganizationAdapterRequired)
 		}
 		// The adapter receives detached business data so it cannot mutate Engine-owned activation input.
@@ -310,8 +312,8 @@ func handleConfig(
 func parseConfig(data json.RawMessage) (Config, error) {
 	// Decode into fresh storage so handler calls never retain or mutate caller-owned JSON bytes.
 	var config Config
-	if err := json.Unmarshal(data, &config); err != nil {
-		return Config{}, fmt.Errorf("approval: parse config: %w", err)
+	if err := jsonstrict.Decode(data, &config); err != nil {
+		return Config{}, fmt.Errorf("%w: parse config: %w", ErrInvalidConfig, err)
 	}
 	// Only the two documented decision policies have complete runtime semantics.
 	if config.Mode != ModeAny && config.Mode != ModeAll {

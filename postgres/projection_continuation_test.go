@@ -75,15 +75,15 @@ func TestProjectionContinuationRejectsMalformedTokensBeforeDatabase(t *testing.T
 	}{
 		{name: "worklist", call: func() error {
 			_, err := projection.WorklistPage(t.Context(), query)
-			return err
+			return wrapProjectionQueryError("worklist page", err)
 		}},
 		{name: "participated", call: func() error {
 			_, err := projection.ParticipatedPage(t.Context(), query)
-			return err
+			return wrapProjectionQueryError("participated page", err)
 		}},
 		{name: "initiated", call: func() error {
 			_, err := projection.InitiatedPage(t.Context(), query)
-			return err
+			return wrapProjectionQueryError("initiated page", err)
 		}},
 	}
 
@@ -108,15 +108,15 @@ func TestProjectionContinuationEnforcesPageLimits(t *testing.T) {
 	}{
 		{name: "worklist", call: func(query postgres.ContinuationQuery) error {
 			_, err := projection.WorklistPage(t.Context(), query)
-			return err
+			return wrapProjectionQueryError("worklist page", err)
 		}},
 		{name: "participated", call: func(query postgres.ContinuationQuery) error {
 			_, err := projection.ParticipatedPage(t.Context(), query)
-			return err
+			return wrapProjectionQueryError("participated page", err)
 		}},
 		{name: "initiated", call: func(query postgres.ContinuationQuery) error {
 			_, err := projection.InitiatedPage(t.Context(), query)
-			return err
+			return wrapProjectionQueryError("initiated page", err)
 		}},
 	}
 
