@@ -13,6 +13,39 @@ import (
 	"github.com/lvpeng/easy-workflow/approval"
 )
 
+// publicationMutationHandlerKind identifies the handler used to probe publication snapshot isolation.
+const publicationMutationHandlerKind = "publication-mutation-test"
+
+var (
+	// errUnexpectedPublicationExecution reports that publication invoked a runtime-only handler method.
+	errUnexpectedPublicationExecution = errors.New("publication mutation handler: unexpected execution")
+)
+
+// publicationMutationHandler mutates caller-owned authoring data during validation.
+//
+// The handler is scoped to one synchronous publication test. It retains the supplied definition only for that call,
+// performs no I/O, and demonstrates that persistence must use the compiler-owned frozen snapshot.
+type publicationMutationHandler struct {
+	// definition is the caller-owned graph deliberately changed after compilation freezes its candidate.
+	definition *workflow.Definition
+}
+
+// Validate corrupts the caller-owned graph while accepting the compiler-owned detached configuration.
+func (h *publicationMutationHandler) Validate(json.RawMessage) error {
+	h.definition.Nodes[len(h.definition.Nodes)-1].ID = "mutated-end"
+	return nil
+}
+
+// Activate is unused because publication compiles but does not execute a definition.
+func (*publicationMutationHandler) Activate(context.Context, workflow.ActivationInput) (workflow.NodeResult, error) {
+	return workflow.NodeResult{}, errUnexpectedPublicationExecution
+}
+
+// Handle is unused because publication compiles but does not execute a definition.
+func (*publicationMutationHandler) Handle(context.Context, workflow.CommandInput) (workflow.NodeResult, error) {
+	return workflow.NodeResult{}, errUnexpectedPublicationExecution
+}
+
 // TestDefinitionPublisherAssignsVersionsAcrossAuthoringPaths verifies Builder and JSON inputs share one version sequence.
 //
 // The publisher owns Version: caller-supplied values are ignored, the first successful publication receives version 1,
@@ -179,6 +212,38 @@ func TestDefinitionPublisherRejectsInvalidDefinitionWithoutConsumingVersion(t *t
 	}
 	if published.Version != 1 {
 		t.Fatalf("Publish(valid) version = %d, want 1", published.Version)
+	}
+}
+
+// TestDefinitionPublisherPersistsCompiledSnapshot verifies validation-time mutations cannot bypass compilation.
+func TestDefinitionPublisherPersistsCompiledSnapshot(t *testing.T) {
+	t.Parallel()
+
+	builder := workflow.NewBuilder("publication-snapshot")
+	builder.Start("start")
+	builder.Node("business", publicationMutationHandlerKind, nil)
+	builder.End("end")
+	builder.Connect("start", "business", "")
+	builder.Connect("business", "end", "done")
+	definition, err := builder.Build()
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+
+	registry := workflow.NewRegistry()
+	if err := registry.Register(publicationMutationHandlerKind, &publicationMutationHandler{definition: definition}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	definitions := workflow.NewMemoryDefinitionStore()
+	published, err := workflow.NewDefinitionPublisher(definitions, registry).Publish(t.Context(), definition)
+	if err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	if published.Nodes[len(published.Nodes)-1].ID != "end" {
+		t.Fatalf("published end node = %q, want compiler snapshot %q", published.Nodes[len(published.Nodes)-1].ID, "end")
+	}
+	if err := workflow.CompileDefinition(published, registry); err != nil {
+		t.Fatalf("CompileDefinition(published) error = %v", err)
 	}
 }
 

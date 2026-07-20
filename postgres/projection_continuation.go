@@ -4,20 +4,19 @@
 package postgres
 
 import (
-	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"time"
 
 	workflow "github.com/lvpeng/easy-workflow"
+	"github.com/lvpeng/easy-workflow/internal/jsonstrict"
 )
 
 const (
 	// continuationEncodingVersion identifies the current wire schema and prevents silent reinterpretation after upgrades.
 	continuationEncodingVersion = 1
-	// maximumContinuationLength bounds untrusted decode allocation; valid current tokens are far below one KiB.
+	// maximumContinuationLength bounds both encoded output and untrusted decode allocation.
 	maximumContinuationLength = 1024
 	// taskContinuationFamily is shared by WorklistPage and ParticipatedPage because their ordering keys are identical.
 	taskContinuationFamily = "task"
@@ -52,7 +51,11 @@ func encodeContinuationEnvelope(envelope continuationEnvelope) (Continuation, er
 	if err != nil {
 		return "", fmt.Errorf("postgres: encode projection continuation: %w", err)
 	}
-	return Continuation(base64.RawURLEncoding.EncodeToString(data)), nil
+	token := Continuation(base64.RawURLEncoding.EncodeToString(data))
+	if len(token) > maximumContinuationLength {
+		return "", fmt.Errorf("%w: encoded continuation is too long", ErrInvalidProjectionQuery)
+	}
+	return token, nil
 }
 
 // decodeContinuationEnvelope strictly decodes one non-empty untrusted opaque token without choosing keyset semantics.
@@ -70,19 +73,10 @@ func decodeContinuationEnvelope(token Continuation) (continuationEnvelope, error
 		return continuationEnvelope{}, fmt.Errorf("%w: continuation encoding: %w", ErrInvalidProjectionQuery, err)
 	}
 
-	// Strict JSON prevents future or attacker-supplied fields from acquiring accidental semantics in an older binary.
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
+	// The shared strict boundary rejects duplicates, case aliases, invalid UTF-8, unknown fields, and trailing values.
 	var envelope continuationEnvelope
-	if err := decoder.Decode(&envelope); err != nil {
+	if err := jsonstrict.Decode(data, &envelope); err != nil {
 		return continuationEnvelope{}, fmt.Errorf("%w: continuation payload: %w", ErrInvalidProjectionQuery, err)
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		if err == nil {
-			return continuationEnvelope{}, fmt.Errorf("%w: continuation contains multiple values", ErrInvalidProjectionQuery)
-		}
-		return continuationEnvelope{}, fmt.Errorf("%w: continuation trailing data: %w", ErrInvalidProjectionQuery, err)
 	}
 	return envelope, nil
 }

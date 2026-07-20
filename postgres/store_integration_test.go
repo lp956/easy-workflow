@@ -24,7 +24,11 @@ import (
 	"github.com/lvpeng/easy-workflow/storetest"
 )
 
-const integrationDSNEnvironment = "EASY_WORKFLOW_POSTGRES_DSN"
+const (
+	integrationDSNEnvironment = "EASY_WORKFLOW_POSTGRES_DSN"
+	// integrationCleanupTimeout prevents failed test cleanup from retaining a connection indefinitely.
+	integrationCleanupTimeout = 5 * time.Second
+)
 
 // withdrawalPolicyFunc adapts an integration-test function to workflow.WithdrawalPolicy.
 type withdrawalPolicyFunc func(context.Context, workflow.ActorID, *workflow.Instance) error
@@ -373,7 +377,9 @@ func assertIntegrationSnapshot(t *testing.T, store workflow.Store, expected *wor
 func rollbackIntegrationTransaction(t *testing.T, tx pgx.Tx) {
 	t.Helper()
 
-	if err := tx.Rollback(context.WithoutCancel(t.Context())); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
+	rollbackContext, cancelRollback := context.WithTimeout(context.WithoutCancel(t.Context()), integrationCleanupTimeout)
+	defer cancelRollback()
+	if err := tx.Rollback(rollbackContext); err != nil && !errors.Is(err, pgx.ErrTxClosed) {
 		t.Errorf("cleanup Rollback() error = %v", err)
 	}
 }

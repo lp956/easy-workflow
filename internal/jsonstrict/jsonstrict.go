@@ -11,6 +11,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"reflect"
+	"strings"
+	"unicode/utf8"
 )
 
 var (
@@ -24,8 +28,16 @@ var (
 // reject unknown fields, while map and interface targets retain their natural open shape. JSON numbers decode as
 // json.Number. Errors wrap ErrInvalid, and neither input bytes nor decoded mutable values are retained by this package.
 func Decode(data []byte, target any) error {
+	// encoding/json replaces malformed source bytes with U+FFFD, which would erase the caller's original meaning.
+	if !utf8.Valid(data) {
+		return fmt.Errorf("%w: source is not valid UTF-8", ErrInvalid)
+	}
 	// Token validation runs first because encoding/json otherwise accepts duplicate object names with last-value-wins.
 	if err := validateUniqueValue(data); err != nil {
+		return err
+	}
+	// Validate member names against the exact typed schema before encoding/json can apply case-insensitive field matching.
+	if err := validateExactSchema(data, target); err != nil {
 		return err
 	}
 
@@ -43,6 +55,133 @@ func Decode(data []byte, target any) error {
 		return fmt.Errorf("%w: read trailing data: %w", ErrInvalid, err)
 	}
 	return nil
+}
+
+// validateExactSchema compares every closed-struct object member with its exact JSON field name.
+//
+// data must already be valid, unique-member JSON. target may be any value accepted or rejected later by encoding/json;
+// non-pointer targets are left to the typed decoder. Maps, interfaces, RawMessage, and custom JSON unmarshallers retain
+// their deliberately open shape. Errors wrap ErrInvalid and no decoded values escape this validation pass.
+func validateExactSchema(data []byte, target any) error {
+	targetType := reflect.TypeOf(target)
+	if targetType == nil || targetType.Kind() != reflect.Pointer {
+		return nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return fmt.Errorf("%w: decode schema value: %w", ErrInvalid, err)
+	}
+	if err := validateExactValue(value, targetType.Elem()); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateExactValue recursively checks objects that decode into closed struct types.
+//
+// value is the generic representation of one already-valid JSON value and targetType is its typed destination. Container
+// recursion mirrors slices, arrays, maps, and pointers; scalar type mismatches remain the typed decoder's responsibility.
+func validateExactValue(value any, targetType reflect.Type) error {
+	for targetType.Kind() == reflect.Pointer {
+		targetType = targetType.Elem()
+	}
+	jsonUnmarshalerType := reflect.TypeFor[json.Unmarshaler]()
+	if targetType == reflect.TypeFor[json.RawMessage]() || targetType.Implements(jsonUnmarshalerType) ||
+		reflect.PointerTo(targetType).Implements(jsonUnmarshalerType) {
+		return nil
+	}
+
+	switch targetType.Kind() { //nolint:exhaustive // Scalar and non-JSON-capable kinds intentionally share the default path.
+	case reflect.Interface:
+		return nil
+	case reflect.Map:
+		return validateExactMap(value, targetType.Elem())
+	case reflect.Slice, reflect.Array:
+		return validateExactArray(value, targetType.Elem())
+	case reflect.Struct:
+		return validateExactStruct(value, targetType)
+	default:
+		return nil
+	}
+}
+
+// validateExactMap recursively validates values from one JSON object against an open typed map value schema.
+func validateExactMap(value any, elementType reflect.Type) error {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	for _, member := range object {
+		if err := validateExactValue(member, elementType); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateExactArray recursively validates elements from one JSON array against its typed element schema.
+func validateExactArray(value any, elementType reflect.Type) error {
+	array, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	for _, member := range array {
+		if err := validateExactValue(member, elementType); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateExactStruct rejects non-canonical member names and recursively validates each known field value.
+func validateExactStruct(value any, targetType reflect.Type) error {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	fields := exactJSONFields(targetType)
+	for name, member := range object {
+		fieldType, exists := fields[name]
+		if !exists {
+			return fmt.Errorf("%w: object member %q does not exactly match the typed schema", ErrInvalid, name)
+		}
+		if err := validateExactValue(member, fieldType); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// exactJSONFields returns the exact member names visible on one exported struct schema.
+//
+// Anonymous exported structs without an explicit name contribute promoted fields. Tagged exclusions are omitted, and
+// collisions remain for encoding/json's typed decoder to classify. The returned map is request-local and read-only.
+func exactJSONFields(targetType reflect.Type) map[string]reflect.Type {
+	fields := make(map[string]reflect.Type)
+	for field := range targetType.Fields() {
+		if field.PkgPath != "" {
+			continue
+		}
+		tagName, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if tagName == "-" {
+			continue
+		}
+		promotedType := field.Type
+		for promotedType.Kind() == reflect.Pointer {
+			promotedType = promotedType.Elem()
+		}
+		if field.Anonymous && tagName == "" && promotedType.Kind() == reflect.Struct {
+			maps.Copy(fields, exactJSONFields(promotedType))
+			continue
+		}
+		if tagName == "" {
+			tagName = field.Name
+		}
+		fields[tagName] = field.Type
+	}
+	return fields
 }
 
 // validateUniqueValue scans one JSON value and rejects duplicate member names at every object depth.

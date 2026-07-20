@@ -68,6 +68,9 @@ func (s *MemoryStore) Create(ctx context.Context, instance *Instance) error {
 	// Hold the exclusive lock across lazy initialization, duplicate detection, and insertion.
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("workflow: create instance: %w", err)
+	}
 	if s.instances == nil {
 		s.instances = make(map[InstanceID]*Instance)
 	}
@@ -75,7 +78,11 @@ func (s *MemoryStore) Create(ctx context.Context, instance *Instance) error {
 	if _, exists := s.instances[instance.ID]; exists {
 		return fmt.Errorf("%w: %q", ErrInstanceExists, instance.ID)
 	}
-	s.instances[instance.ID] = cloneInstance(instance)
+	snapshot := cloneInstance(instance)
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("workflow: create instance: %w", err)
+	}
+	s.instances[instance.ID] = snapshot
 	return nil
 }
 
@@ -96,12 +103,19 @@ func (s *MemoryStore) Load(ctx context.Context, id InstanceID) (*Instance, error
 	// Clone while holding the read lock so every field comes from one consistent stored pointer.
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("workflow: load instance: %w", err)
+	}
 	instance, exists := s.instances[id]
 	// Missing identity never falls back to another or newly created instance.
 	if !exists {
 		return nil, fmt.Errorf("%w: %q", ErrInstanceNotFound, id)
 	}
-	return cloneInstance(instance), nil
+	snapshot := cloneInstance(instance)
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("workflow: load instance: %w", err)
+	}
+	return snapshot, nil
 }
 
 // Save atomically replaces a snapshot only when expectedVersion matches the durable version.
@@ -122,6 +136,9 @@ func (s *MemoryStore) Save(ctx context.Context, instance *Instance, expectedVers
 	// Hold one exclusive lock across comparison and replacement so CAS is atomic for concurrent commands.
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("workflow: save instance: %w", err)
+	}
 	stored, exists := s.instances[instance.ID]
 	// Save never creates a missing aggregate because creation has a separate insert-only contract.
 	if !exists {
@@ -135,7 +152,11 @@ func (s *MemoryStore) Save(ctx context.Context, instance *Instance, expectedVers
 	if len(instance.Audit) < len(stored.Audit) || !slices.Equal(instance.Audit[:len(stored.Audit)], stored.Audit) {
 		return fmt.Errorf("%w: save cannot rewrite audit history for %q", ErrInvalidStoreInput, instance.ID)
 	}
-	s.instances[instance.ID] = cloneInstance(instance)
+	snapshot := cloneInstance(instance)
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("workflow: save instance: %w", err)
+	}
+	s.instances[instance.ID] = snapshot
 	return nil
 }
 

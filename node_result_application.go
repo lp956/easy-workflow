@@ -195,6 +195,10 @@ func (a *nodeResultApplication) prepareTasks(instance *Instance) error {
 	// Preserve the three intentionally different task contracts instead of forcing them through one generic merge.
 	switch a.stage {
 	case nodeResultActivation:
+		// A waiting activation must expose at least one actionable command path into the running instance.
+		if a.result.Disposition == DispositionWaiting && len(a.result.Tasks) == 0 {
+			return invalidNodeResult(a.stage, a.nodeID, "waiting activation contains no task drafts")
+		}
 		// A node that routes immediately cannot leave active task drafts behind at a historical node.
 		if a.result.Disposition != DispositionWaiting && len(a.result.Tasks) != 0 {
 			return invalidNodeResult(a.stage, a.nodeID, "routed activation contains task drafts")

@@ -305,21 +305,23 @@ func decodeConfig(data []byte, target *Config) error {
 // evaluateRule combines a validated rule's expressions under its explicit all or any mode.
 //
 // rule must have MatchAll or MatchAny and at least one expression. Missing fields and type mismatches are
-// returned rather than treated as false; the boolean reports the selected combination result.
+// returned rather than treated as false. Every expression is evaluated before the boolean combination is returned,
+// making validation errors independent of condition order.
 func evaluateRule(rule Rule, data map[string]any) (bool, error) {
+	matchedCount := 0
 	for _, expression := range rule.Conditions {
 		matched, err := evaluateExpression(expression, data)
 		if err != nil {
 			return false, err
 		}
-		if rule.Match == MatchAny && matched {
-			return true, nil
-		}
-		if rule.Match == MatchAll && !matched {
-			return false, nil
+		if matched {
+			matchedCount++
 		}
 	}
-	return rule.Match == MatchAll, nil
+	if rule.Match == MatchAll {
+		return matchedCount == len(rule.Conditions), nil
+	}
+	return matchedCount > 0, nil
 }
 
 // evaluateExpression applies one validated typed expression against business data.

@@ -41,6 +41,10 @@ const deleteParticipationProjectionSQL = `
 func replaceQueryProjection(ctx context.Context, tx pgx.Tx, instance *workflow.Instance) error {
 	// Derive audit timestamps before writing either projection table so malformed inputs cannot leave partial rows.
 	startedAt, lastAuditAt, orderAt := projectionAuditTimes(instance.Audit)
+	// Preflight every row key in memory so the adapter never persists data its own continuation decoder cannot page.
+	if err := validateProjectionContinuationKeys(instance, orderAt); err != nil {
+		return err
+	}
 	// Upsert the instance row first because every task-derived row references it within the same transaction.
 	if _, err := tx.Exec(ctx, upsertInstanceProjectionSQL,
 		instance.ID,
@@ -89,6 +93,30 @@ func replaceQueryProjection(ctx context.Context, tx pgx.Tx, instance *workflow.I
 	); err != nil {
 		// Bulk-copy failure rolls back parent, facts, and projection together under the owning transaction.
 		return fmt.Errorf("copy participation query projection: %w", err)
+	}
+	return nil
+}
+
+// validateProjectionContinuationKeys ensures every projected row can produce a reusable opaque continuation.
+//
+// instance must be the candidate aggregate and orderAt the timestamp derived for its instance projection. The function
+// performs one bounded in-memory pass over aggregate tasks before any database I/O. Only concrete task relations mirror
+// replaceQueryProjection rows; every failure wraps workflow.ErrInvalidStoreInput and no token escapes the preflight.
+func validateProjectionContinuationKeys(instance *workflow.Instance, orderAt time.Time) error {
+	if _, err := encodeInstanceContinuation(instanceProjectionKeyset{at: orderAt, instanceID: instance.ID}); err != nil {
+		return fmt.Errorf("%w: instance projection continuation: %w", workflow.ErrInvalidStoreInput, err)
+	}
+	for _, task := range instance.Tasks {
+		if task.Assignee == "" || task.NodeID == "" || task.Status == workflow.TaskStatusUnknown {
+			continue
+		}
+		if _, err := encodeTaskContinuation(taskProjectionKeyset{
+			at:         orderAt,
+			instanceID: instance.ID,
+			taskID:     task.ID,
+		}); err != nil {
+			return fmt.Errorf("%w: task %q projection continuation: %w", workflow.ErrInvalidStoreInput, task.ID, err)
+		}
 	}
 	return nil
 }

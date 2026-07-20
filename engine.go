@@ -153,6 +153,11 @@ func (e *Engine) Handle(ctx context.Context, command Command) (*Instance, error)
 		instanceID:      command.InstanceID,
 		nonRunningError: ErrInvalidCommand,
 		prepare: func(snapshot *Instance) error {
+			// Authorize against durable current-node facts before any handler-owned compilation or execution runs.
+			tasks := nodeTasks(snapshot.Tasks, snapshot.CurrentNodeID)
+			if err := validateCommandTask(tasks, command); err != nil {
+				return err
+			}
 			var err error
 			plan, err = compileDefinition(&snapshot.Definition, e.registry)
 			if err != nil {
@@ -170,7 +175,7 @@ func (e *Engine) Handle(ctx context.Context, command Command) (*Instance, error)
 				Command: command,
 				Data:    slices.Clone(snapshot.Data),
 				State:   slices.Clone(snapshot.NodeState),
-				Tasks:   nodeTasks(snapshot.Tasks, node.ID),
+				Tasks:   tasks,
 			})
 			if err != nil {
 				return fmt.Errorf("workflow: handle node %q command: %w", node.ID, err)
@@ -193,6 +198,24 @@ func (e *Engine) Handle(ctx context.Context, command Command) (*Instance, error)
 			return e.advance(ctx, facts, plan, outcome)
 		},
 	})
+}
+
+// validateCommandTask authorizes one command against the complete current-node task view.
+//
+// tasks must contain only tasks owned by the active node. The command is accepted only when its identity resolves to an
+// active task assigned to the actor. The function performs no I/O, retains no input, and wraps ErrInvalidCommand for
+// unknown, inactive, or foreign-owned tasks without exposing handler-specific policy.
+func validateCommandTask(tasks []Task, command Command) error {
+	for _, task := range tasks {
+		if task.ID != command.TaskID {
+			continue
+		}
+		if task.Status != TaskStatusActive || task.Assignee != command.ActorID {
+			return fmt.Errorf("%w: task %q is not active for actor", ErrInvalidCommand, command.TaskID)
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: task %q does not belong to the current node", ErrInvalidCommand, command.TaskID)
 }
 
 // Withdraw authorizes and atomically ends one running instance without executing its active node handler.

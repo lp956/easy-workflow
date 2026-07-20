@@ -3,6 +3,7 @@
 package postgres_test
 
 import (
+	"encoding/base64"
 	"errors"
 	"slices"
 	"testing"
@@ -11,6 +12,11 @@ import (
 	workflow "github.com/lvpeng/easy-workflow"
 	"github.com/lvpeng/easy-workflow/postgres"
 )
+
+// opaqueContinuation encodes raw payload bytes using the public continuation transport representation.
+func opaqueContinuation(payload []byte) postgres.Continuation {
+	return postgres.Continuation(base64.RawURLEncoding.EncodeToString(payload))
+}
 
 // TestProjectionContinuationReturnsEmptyPageForEmptyScope verifies all token APIs preserve deny-all authorization.
 func TestProjectionContinuationReturnsEmptyPageForEmptyScope(t *testing.T) {
@@ -92,6 +98,37 @@ func TestProjectionContinuationRejectsMalformedTokensBeforeDatabase(t *testing.T
 		t.Run(family.name, func(t *testing.T) {
 			if err := family.call(); !errors.Is(err, postgres.ErrInvalidProjectionQuery) {
 				t.Fatalf("query error = %v, want ErrInvalidProjectionQuery", err)
+			}
+		})
+	}
+}
+
+// TestProjectionContinuationRejectsAmbiguousJSON verifies opaque tokens share the repository's strict JSON contract.
+func TestProjectionContinuationRejectsAmbiguousJSON(t *testing.T) {
+	t.Parallel()
+
+	validPrefix := `{"v":1,"f":"instance","a":"2026-01-01T00:00:00Z","i":"instance-a"`
+	invalidUTF8 := append([]byte(`{"v":1,"f":"instance","a":"2026-01-01T00:00:00Z","i":"`), 0xff)
+	invalidUTF8 = append(invalidUTF8, []byte(`"}`)...)
+	tokens := []struct {
+		name  string
+		token postgres.Continuation
+	}{
+		{name: "case alias", token: opaqueContinuation([]byte(validPrefix + `,"V":1}`))},
+		{name: "invalid UTF-8", token: opaqueContinuation(invalidUTF8)},
+	}
+	projection := postgres.NewProjection(newClosedProjectionPool(t))
+	for _, test := range tokens {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := projection.InitiatedPage(t.Context(), postgres.ContinuationQuery{
+				ActorID: "actor-a",
+				Scope:   postgres.QueryScope{InstanceIDs: []workflow.InstanceID{}},
+				Page:    postgres.ContinuationPageRequest{After: test.token},
+			})
+			if !errors.Is(err, postgres.ErrInvalidProjectionQuery) {
+				t.Fatalf("InitiatedPage() error = %v, want ErrInvalidProjectionQuery", err)
 			}
 		})
 	}

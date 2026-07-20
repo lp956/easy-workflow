@@ -180,8 +180,8 @@ func TestEngineTransfersCountersignTask(t *testing.T) {
 		ActorID:    oldTask.Assignee,
 		Name:       approval.CommandApprove,
 	})
-	if !errors.Is(err, approval.ErrTaskNotActive) {
-		t.Errorf("old assignee Handle() error = %v, want ErrTaskNotActive", err)
+	if !errors.Is(err, workflow.ErrInvalidCommand) {
+		t.Errorf("old assignee Handle() error = %v, want ErrInvalidCommand", err)
 	}
 	transferred, err = engine.Handle(t.Context(), workflow.Command{
 		InstanceID: transferred.ID,

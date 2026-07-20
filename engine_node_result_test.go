@@ -58,6 +58,8 @@ const (
 	violationMissingDisposition malformedResultViolation = "missing-disposition"
 	// violationWaitingOutcome attaches an ignored route selector to a waiting result.
 	violationWaitingOutcome malformedResultViolation = "waiting-outcome"
+	// violationWaitingWithoutTasks proposes an activation that can neither accept a command nor advance.
+	violationWaitingWithoutTasks malformedResultViolation = "waiting-without-tasks"
 	// violationRoutedActivationTasks attaches task drafts to a result that immediately leaves its node.
 	violationRoutedActivationTasks malformedResultViolation = "routed-activation-tasks"
 )
@@ -351,6 +353,72 @@ func TestEngineRejectsMalformedTaskDecisionSets(t *testing.T) {
 	}
 }
 
+// TestEngineAuthorizesTaskCommandsBeforeHandlerExecution verifies the core task boundary independently of handler policy.
+func TestEngineAuthorizesTaskCommandsBeforeHandlerExecution(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		command func(*workflow.Instance) workflow.Command
+		mutate  func(*workflow.Instance)
+	}{
+		{
+			name: "wrong actor",
+			command: func(instance *workflow.Instance) workflow.Command {
+				return workflow.Command{InstanceID: instance.ID, TaskID: instance.Tasks[0].ID, ActorID: "owner-b", Name: "decide"}
+			},
+		},
+		{
+			name: "unknown task",
+			command: func(instance *workflow.Instance) workflow.Command {
+				return workflow.Command{InstanceID: instance.ID, TaskID: "unknown-task", ActorID: instance.Tasks[0].Assignee, Name: "decide"}
+			},
+		},
+		{
+			name: "inactive task",
+			mutate: func(instance *workflow.Instance) {
+				instance.Tasks[0].Status = workflow.TaskStatusClosed
+			},
+			command: func(instance *workflow.Instance) workflow.Command {
+				return workflow.Command{InstanceID: instance.ID, TaskID: instance.Tasks[0].ID, ActorID: instance.Tasks[0].Assignee, Name: "decide"}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			// An unrecognized violation makes the test handler echo the current task set without enforcing command ownership.
+			engine, store, before := startTaskSetResultInstance(
+				t,
+				taskSetViolation("authorization-pass-through"),
+				workflow.InstanceID("task-authorization-"+test.name),
+			)
+			if test.mutate != nil {
+				expectedVersion := before.Version
+				test.mutate(before)
+				before.Version++
+				if err := store.Save(t.Context(), before, expectedVersion); err != nil {
+					t.Fatalf("Save(test authorization state) error = %v", err)
+				}
+			}
+
+			_, err := engine.Handle(t.Context(), test.command(before))
+			if !errors.Is(err, workflow.ErrInvalidCommand) {
+				t.Fatalf("Handle() error = %v, want ErrInvalidCommand", err)
+			}
+			after, loadErr := store.Load(t.Context(), before.ID)
+			if loadErr != nil {
+				t.Fatalf("Load() error = %v", loadErr)
+			}
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("stored instance changed after unauthorized command:\n got: %#v\nwant: %#v", after, before)
+			}
+		})
+	}
+}
+
 // TestEngineRejectsMalformedActivationResultsAtomically verifies activation rules fail before instance creation.
 func TestEngineRejectsMalformedActivationResultsAtomically(t *testing.T) {
 	t.Parallel()
@@ -359,6 +427,7 @@ func TestEngineRejectsMalformedActivationResultsAtomically(t *testing.T) {
 		violationInvalidState,
 		violationMissingDisposition,
 		violationWaitingOutcome,
+		violationWaitingWithoutTasks,
 		violationRoutedActivationTasks,
 	}
 	for _, violation := range violations {
@@ -468,6 +537,7 @@ func TestEngineRejectsMalformedReturnResultsAtomically(t *testing.T) {
 		violationInvalidState,
 		violationMissingDisposition,
 		violationWaitingOutcome,
+		violationWaitingWithoutTasks,
 		violationRoutedActivationTasks,
 	}
 	for _, violation := range violations {

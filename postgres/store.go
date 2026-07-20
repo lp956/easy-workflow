@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -15,6 +16,9 @@ import (
 
 	workflow "github.com/lvpeng/easy-workflow"
 )
+
+// transactionRollbackTimeout bounds one cleanup round trip after a failed, canceled, or committed transaction.
+const transactionRollbackTimeout = 5 * time.Second
 
 const (
 	insertInstanceSQL = `
@@ -259,14 +263,24 @@ func copyAudit(ctx context.Context, tx pgx.Tx, id workflow.InstanceID, audit [][
 	return nil
 }
 
-// withTransaction executes one operation and guarantees rollback after every failed or canceled path.
+// newTransactionRollbackContext creates a bounded cleanup context independent of request cancellation.
+//
+// parent values remain available to the driver, while its cancellation and deadline are detached before applying the
+// cleanup-specific timeout. The caller must invoke the returned cancel function after the single rollback attempt.
+func newTransactionRollbackContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), transactionRollbackTimeout)
+}
+
+// withTransaction executes one operation and guarantees bounded rollback after every failed or canceled path.
 func withTransaction(ctx context.Context, pool *pgxpool.Pool, options pgx.TxOptions, operation func(pgx.Tx) error) (err error) {
 	tx, err := pool.BeginTx(ctx, options)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 	defer func() {
-		rollbackErr := tx.Rollback(context.WithoutCancel(ctx))
+		rollbackContext, cancelRollback := newTransactionRollbackContext(ctx)
+		rollbackErr := tx.Rollback(rollbackContext)
+		cancelRollback()
 		if rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
 			err = errors.Join(err, fmt.Errorf("rollback transaction: %w", rollbackErr))
 		}

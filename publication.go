@@ -69,13 +69,14 @@ func (p *DefinitionPublisher) Publish(ctx context.Context, definition *Definitio
 	if p == nil || nilguard.IsNil(p.writer) || p.registry == nil {
 		return nil, fmt.Errorf("%w: dependencies are nil", ErrInvalidPublisher)
 	}
-	// Compilation must finish before the first storage call so invalid attempts cannot reserve a version.
-	if err := CompileDefinition(definition, p.registry); err != nil {
+	// Retain the compiler-owned snapshot so caller or handler mutations cannot alter the persistence candidate afterward.
+	plan, err := compileDefinition(definition, p.registry)
+	if err != nil {
 		return nil, err
 	}
 
 	// Clear authoring metadata so the writer is the only authority that can allocate a published version.
-	candidate := cloneDefinition(*definition)
+	candidate := cloneDefinition(plan.definition)
 	candidate.Version = 0
 	published, err := p.writer.CreateVersion(ctx, &candidate)
 	// Writer errors preserve their cause while adding the stable Definition identity for operations.
@@ -125,7 +126,7 @@ func NewMemoryDefinitionStore() *MemoryDefinitionStore {
 //
 // definition must be non-nil, fully compiled, and retain a stable non-empty ID; Version is ignored.
 // The method serializes allocation and insertion under one lock, returns a defensive copy, and performs
-// no external I/O. Context cancellation before lock acquisition leaves the store unchanged.
+// no external I/O. Context cancellation through the insertion boundary leaves the store unchanged.
 func (s *MemoryDefinitionStore) CreateVersion(ctx context.Context, definition *Definition) (*Definition, error) {
 	// Reject unusable ownership boundaries before touching the adapter's synchronization state.
 	if s == nil || definition == nil || definition.ID == "" {
@@ -145,6 +146,9 @@ func (s *MemoryDefinitionStore) CreateVersion(ctx context.Context, definition *D
 	}
 	versions := s.definitions[definition.ID]
 	snapshot := cloneDefinition(*definition)
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("workflow: create definition version: %w", err)
+	}
 	// The append-only slice length equals the last gap-free version, so one selects the next positive version.
 	snapshot.Version = uint64(len(versions)) + 1
 	s.definitions[definition.ID] = append(versions, snapshot)
@@ -168,13 +172,20 @@ func (s *MemoryDefinitionStore) Load(ctx context.Context, id string, version uin
 	// Hold the read lock while selecting and cloning so no append can replace the backing slice mid-read.
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("workflow: load definition: %w", err)
+	}
 	versions := s.definitions[id]
 	// Exact lookup never falls forward to another version when the requested position is absent.
 	if version > uint64(len(versions)) {
 		return nil, fmt.Errorf("%w: id %q version %d", ErrDefinitionNotFound, id, version)
 	}
 	snapshot := versions[version-1] // Published version 1 occupies zero-based slice position 0.
-	return cloneDefinitionPointer(&snapshot), nil
+	result := cloneDefinitionPointer(&snapshot)
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("workflow: load definition: %w", err)
+	}
+	return result, nil
 }
 
 // LoadLatest returns a defensive copy of the greatest immutable version stored for one ID.
@@ -194,13 +205,20 @@ func (s *MemoryDefinitionStore) LoadLatest(ctx context.Context, id string) (*Def
 	// Clone under the read lock so the selected latest position and its bytes come from one snapshot.
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("workflow: load latest definition: %w", err)
+	}
 	versions := s.definitions[id]
 	// An empty append-only sequence has no latest-version fallback to return.
 	if len(versions) == 0 {
 		return nil, fmt.Errorf("%w: id %q", ErrDefinitionNotFound, id)
 	}
 	snapshot := versions[len(versions)-1] // The append-only final element is the greatest published version.
-	return cloneDefinitionPointer(&snapshot), nil
+	result := cloneDefinitionPointer(&snapshot)
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("workflow: load latest definition: %w", err)
+	}
+	return result, nil
 }
 
 // cloneDefinitionPointer returns a detached Definition while preserving nil input as nil.

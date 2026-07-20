@@ -151,6 +151,54 @@ func TestActivateSupportsExplicitMatchModes(t *testing.T) {
 	}
 }
 
+// TestActivateReportsExpressionErrorsRegardlessOfOrder verifies match modes cannot hide invalid business data.
+func TestActivateReportsExpressionErrorsRegardlessOfOrder(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		match      condition.MatchMode
+		knownValue string
+	}{
+		{name: "any after true", match: condition.MatchAny, knownValue: "north"},
+		{name: "all after false", match: condition.MatchAll, knownValue: "south"},
+	}
+	for _, test := range tests {
+		for _, reverse := range []bool{false, true} {
+			name := test.name + " forward"
+			if reverse {
+				name = test.name + " reversed"
+			}
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+
+				expressions := []condition.Expression{
+					{Field: "/region", Type: condition.TypeString, Operator: condition.OperatorEqual, Value: test.knownValue},
+					{Field: "/missing", Type: condition.TypeString, Operator: condition.OperatorEqual, Value: "value"},
+				}
+				if reverse {
+					expressions[0], expressions[1] = expressions[1], expressions[0]
+				}
+				config, err := json.Marshal(condition.Config{
+					Rules:          []condition.Rule{{Match: test.match, Outcome: "matched", Conditions: expressions}},
+					DefaultOutcome: "default",
+				})
+				if err != nil {
+					t.Fatalf("json.Marshal() error = %v", err)
+				}
+
+				_, err = condition.NewHandler().Activate(t.Context(), workflow.ActivationInput{
+					Config: config,
+					Data:   json.RawMessage(`{"region":"north"}`),
+				})
+				if !errors.Is(err, condition.ErrFieldNotFound) {
+					t.Fatalf("Activate() error = %v, want ErrFieldNotFound", err)
+				}
+			})
+		}
+	}
+}
+
 // TestActivateEnforcesUniqueRuleSelection verifies explicit default, no-match, and overlap behavior.
 func TestActivateEnforcesUniqueRuleSelection(t *testing.T) {
 	t.Parallel()
