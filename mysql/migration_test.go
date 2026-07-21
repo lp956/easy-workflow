@@ -30,6 +30,16 @@ func TestMigrationsExposeInitialSchema(t *testing.T) {
 			t.Errorf("initial migration does not define %q", table)
 		}
 	}
+	for _, fragment := range []string{
+		"MySQL 8.0.16",
+		"utf8mb4_0900_bin",
+		"CHECK (task_id <> '')",
+		"CHECK (action <> '')",
+	} {
+		if !strings.Contains(string(data), fragment) {
+			t.Errorf("initial migration does not contain %q", fragment)
+		}
+	}
 }
 
 // TestNewReturnsStore verifies that explicit database injection constructs the public workflow Store adapter.

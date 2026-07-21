@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"io/fs"
 	"os"
 	"reflect"
@@ -52,6 +53,141 @@ func TestStoreRollsBackAggregateReplacement(t *testing.T) {
 	assertIntegrationSnapshot(t, store, original)
 }
 
+// TestStoreAllowsNoopSave verifies MySQL's zero-changed-row result is classified as a matched CAS.
+func TestStoreAllowsNoopSave(t *testing.T) {
+	dsn := requireIntegrationDSN(t)
+	store := newIsolatedStore(t, dsn)
+	instance := integrationInstance("noop-save", 1)
+	if err := store.Create(t.Context(), instance); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if err := store.Save(t.Context(), instance, 1); err != nil {
+		t.Fatalf("no-op Save() error = %v", err)
+	}
+	assertIntegrationSnapshot(t, store, instance)
+}
+
+// TestStoreRejectsEmptyChildValues verifies application-side validation does not depend on MySQL CHECK enforcement.
+func TestStoreRejectsEmptyChildValues(t *testing.T) {
+	dsn := requireIntegrationDSN(t)
+	tests := []struct {
+		name   string
+		mutate func(*workflow.Instance)
+	}{
+		{
+			name: "task id",
+			mutate: func(instance *workflow.Instance) {
+				instance.Tasks[0].ID = ""
+			},
+		},
+		{
+			name: "task status",
+			mutate: func(instance *workflow.Instance) {
+				instance.Tasks[0].Status = ""
+			},
+		},
+		{
+			name: "audit action",
+			mutate: func(instance *workflow.Instance) {
+				instance.Audit[0].Action = ""
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := newIsolatedStore(t, dsn)
+			instance := integrationInstance(workflow.InstanceID("invalid-child-"+test.name), 1)
+			test.mutate(instance)
+			if err := store.Create(t.Context(), instance); !errors.Is(err, workflow.ErrInvalidStoreInput) {
+				t.Fatalf("Create() error = %v, want ErrInvalidStoreInput", err)
+			}
+		})
+	}
+}
+
+// TestStoreDistinguishesTrailingSpaceIdentifiers verifies indexed identities use NO PAD comparison semantics.
+func TestStoreDistinguishesTrailingSpaceIdentifiers(t *testing.T) {
+	dsn := requireIntegrationDSN(t)
+	store := newIsolatedStore(t, dsn)
+	withoutSpace := integrationInstance("identity", 1)
+	withSpace := integrationInstance("identity ", 1)
+	if err := store.Create(t.Context(), withoutSpace); err != nil {
+		t.Fatalf("Create(withoutSpace) error = %v", err)
+	}
+	if err := store.Create(t.Context(), withSpace); err != nil {
+		t.Fatalf("Create(withSpace) error = %v", err)
+	}
+	assertIntegrationSnapshot(t, store, withoutSpace)
+	assertIntegrationSnapshot(t, store, withSpace)
+}
+
+// TestStoreSaveHonorsContextWhileWaitingForCASLock verifies a canceled row-lock wait returns promptly.
+func TestStoreSaveHonorsContextWhileWaitingForCASLock(t *testing.T) {
+	dsn := requireIntegrationDSN(t)
+	store, db := newIsolatedStoreAndDB(t, dsn)
+	instance := integrationInstance("locked-save", 1)
+	if err := store.Create(t.Context(), instance); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	locker, err := db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("BeginTx() error = %v", err)
+	}
+	defer func() {
+		if rollbackErr := locker.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			t.Errorf("lock transaction Rollback() error = %v", rollbackErr)
+		}
+	}()
+	if _, err := locker.ExecContext(t.Context(), "SELECT id FROM easy_workflow_instances WHERE id = ? FOR UPDATE", instance.ID); err != nil {
+		t.Fatalf("lock instance error = %v", err)
+	}
+
+	candidate := integrationInstance(instance.ID, 2)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	saveDone := make(chan error, 1)
+	go func() {
+		saveDone <- store.Save(ctx, candidate, 1)
+	}()
+
+	select {
+	case err := <-saveDone:
+		if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+			t.Fatalf("Save() error = %v, want context cancellation", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Save() did not return after context cancellation")
+	}
+}
+
+// TestMigrationRoundTrip verifies the embedded down migration removes every initial table.
+func TestMigrationRoundTrip(t *testing.T) {
+	dsn := requireIntegrationDSN(t)
+	_, db := newIsolatedStoreAndDB(t, dsn)
+	downSQL, err := fs.ReadFile(mysql.Migrations(), "migrations/0001_init.down.sql")
+	if err != nil {
+		t.Fatalf("ReadFile(down migration) error = %v", err)
+	}
+	if _, err := db.ExecContext(t.Context(), string(downSQL)); err != nil {
+		t.Fatalf("down migration error = %v", err)
+	}
+	for _, table := range []string{
+		"easy_workflow_instances",
+		"easy_workflow_tasks",
+		"easy_workflow_audit",
+	} {
+		var found string
+		err := db.QueryRowContext(t.Context(),
+			"SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?",
+			table,
+		).Scan(&found)
+		if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("table %q lookup error = %v, want sql.ErrNoRows", table, err)
+		}
+	}
+}
+
 // TestStorePreservesLosslessBoundaryValues verifies uint64 and nil-versus-empty snapshot fidelity.
 func TestStorePreservesLosslessBoundaryValues(t *testing.T) {
 	dsn := requireIntegrationDSN(t)
@@ -93,6 +229,13 @@ func requireIntegrationDSN(t *testing.T) string {
 // newIsolatedStore creates a random database, applies the embedded schema, and registers cleanup.
 func newIsolatedStore(t *testing.T, dsn string) workflow.Store {
 	t.Helper()
+	store, _ := newIsolatedStoreAndDB(t, dsn)
+	return store
+}
+
+// newIsolatedStoreAndDB creates an isolated Store and returns its database handle for database-specific tests.
+func newIsolatedStoreAndDB(t *testing.T, dsn string) (workflow.Store, *sql.DB) {
+	t.Helper()
 
 	config, err := mysqldriver.ParseDSN(dsn)
 	if err != nil {
@@ -116,7 +259,7 @@ func newIsolatedStore(t *testing.T, dsn string) workflow.Store {
 	}
 	databaseName := "easy_workflow_test_" + hex.EncodeToString(random)
 	identifier := "`" + databaseName + "`"
-	if _, err := adminDB.ExecContext(t.Context(), "CREATE DATABASE "+identifier+" CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"); err != nil {
+	if _, err := adminDB.ExecContext(t.Context(), "CREATE DATABASE "+identifier+" CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin"); err != nil {
 		adminDB.Close()
 		t.Fatalf("CREATE DATABASE error = %v", err)
 	}
@@ -145,7 +288,7 @@ func newIsolatedStore(t *testing.T, dsn string) workflow.Store {
 	})
 
 	applyInitialMigration(t, db)
-	return mysql.New(db)
+	return mysql.New(db), db
 }
 
 // applyInitialMigration executes the embedded up migration as one setup operation for an isolated database.

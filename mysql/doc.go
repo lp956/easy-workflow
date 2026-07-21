@@ -8,6 +8,7 @@
 // Store.Create and Store.Save own their transaction boundaries: the parent Instance, frozen Definition, business
 // data, node state, tasks, and append-only audit suffix commit or roll back together. Save's conditional version
 // update is the cross-process compare-and-swap authority and reports stale writes through workflow.ErrVersionConflict.
-// The embedded schema uses case-sensitive utf8mb4 VARCHAR(255) columns for indexed identifiers and validates those
-// column values before writing; opaque Definition, business, task, and audit payloads use LONGBLOB storage.
+// The embedded schema requires MySQL 8.0.16 or later, uses case-sensitive NO PAD utf8mb4 VARCHAR(255) columns for
+// indexed identifiers, and validates child-row values before writing; opaque Definition, business, task, and audit
+// payloads use LONGBLOB storage.
 package mysql

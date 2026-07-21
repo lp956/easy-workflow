@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	workflow "github.com/lvpeng/easy-workflow"
 )
@@ -37,7 +38,12 @@ const (
 	loadVersionSQL    = `SELECT CAST(version AS CHAR) FROM easy_workflow_instances WHERE id = ? FOR UPDATE`
 )
 
-const maxInsertBatchSize = 500
+const (
+	maxInsertBatchSize         = 500
+	transactionRollbackTimeout = 5 * time.Second
+)
+
+var errTransactionRollbackTimeout = errors.New("mysql: transaction rollback timed out")
 
 // Store persists complete workflow instance snapshots in MySQL.
 //
@@ -296,16 +302,16 @@ func insertRows(ctx context.Context, tx *sql.Tx, table string, columns []string,
 	return nil
 }
 
-// withTransaction executes one operation and rolls back every failed, canceled, or committed path.
-// database/sql exposes Rollback without a context; it is called immediately by the deferred cleanup path after the
-// context-aware statements and bounded transaction operation have returned.
+// withTransaction executes one operation and rolls back every failed, canceled, or committed path. BeginTx binds ctx
+// to the transaction, so database/sql also aborts a transaction whose context is canceled. The explicit rollback
+// cleanup has a bounded wait because database/sql exposes Rollback without a context.
 func withTransaction(ctx context.Context, db *sql.DB, options *sql.TxOptions, operation func(*sql.Tx) error) (err error) {
 	tx, err := db.BeginTx(ctx, options)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 	defer func() {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+		if rollbackErr := rollbackTransaction(tx); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
 			err = errors.Join(err, fmt.Errorf("rollback transaction: %w", rollbackErr))
 		}
 	}()
@@ -320,4 +326,23 @@ func withTransaction(ctx context.Context, db *sql.DB, options *sql.TxOptions, op
 		return fmt.Errorf("commit transaction: %w", err)
 	}
 	return nil
+}
+
+// rollbackTransaction bounds how long a failed request waits for database/sql to finish driver cleanup. A driver that
+// remains blocked after the timeout still owns its connection until it returns; the bounded caller path prevents one
+// failed request from remaining blocked indefinitely while preserving the original operation error.
+func rollbackTransaction(tx *sql.Tx) error {
+	rollbackResult := make(chan error, 1)
+	go func() {
+		rollbackResult <- tx.Rollback()
+	}()
+
+	timer := time.NewTimer(transactionRollbackTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-rollbackResult:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("%w after %s", errTransactionRollbackTimeout, transactionRollbackTimeout)
+	}
 }

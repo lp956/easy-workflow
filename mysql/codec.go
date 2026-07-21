@@ -49,6 +49,9 @@ const maxStoredStringLength = 255
 
 // encodeSnapshot creates lossless byte payloads without retaining caller-owned mutable slices.
 func encodeSnapshot(instance *workflow.Instance) (encodedSnapshot, error) {
+	if err := validateStoredValues(instance); err != nil {
+		return encodedSnapshot{}, err
+	}
 	if err := validateStoredStringLengths(instance); err != nil {
 		return encodedSnapshot{}, err
 	}
@@ -78,6 +81,25 @@ func encodeSnapshot(instance *workflow.Instance) (encodedSnapshot, error) {
 		tasks:         tasks,
 		audit:         audit,
 	}, nil
+}
+
+// validateStoredValues mirrors the child-row CHECK constraints so invalid aggregates are rejected even when a host
+// connects to a MySQL version that does not enforce CHECK constraints.
+func validateStoredValues(instance *workflow.Instance) error {
+	for index, task := range instance.Tasks {
+		if task.ID == "" {
+			return fmt.Errorf("%w: mysql task %d ID cannot be empty", workflow.ErrInvalidStoreInput, index)
+		}
+		if task.Status == "" {
+			return fmt.Errorf("%w: mysql task %d status cannot be empty", workflow.ErrInvalidStoreInput, index)
+		}
+	}
+	for index, record := range instance.Audit {
+		if record.Action == "" {
+			return fmt.Errorf("%w: mysql audit %d action cannot be empty", workflow.ErrInvalidStoreInput, index)
+		}
+	}
+	return nil
 }
 
 // validateStoredStringLengths rejects values that would exceed MySQL's indexed VARCHAR columns before any write.

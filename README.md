@@ -476,9 +476,16 @@ if err != nil {
 store := workflowmysql.New(db)
 ```
 
-The MySQL adapter provides durable Instance, Task, and Audit snapshots with transactional CAS and append-only audit
-semantics. Indexed identifiers use case-sensitive utf8mb4 `VARCHAR(255)` columns; longer values are rejected before
-database I/O. It currently does not provide the PostgreSQL package's query projection API.
+The MySQL adapter requires MySQL 8.0.16 or later. It provides durable Instance, Task, and Audit snapshots with
+transactional CAS and append-only audit semantics. Indexed identifiers use case-sensitive NO PAD utf8mb4
+`VARCHAR(255)` columns; longer values and invalid child-row values are rejected before database I/O. It currently
+does not provide the PostgreSQL package's query projection API.
+
+MySQL integration tests require an explicit DSN and create isolated databases:
+
+```bash
+EASY_WORKFLOW_MYSQL_DSN='user:password@tcp(localhost:3306)/mysql?parseTime=true' go test ./mysql -count=1
+```
 
 ## 公开契约
 
