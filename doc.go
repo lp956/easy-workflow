@@ -26,6 +26,7 @@
 // while official durable adapters must satisfy the same reusable definitiontest contract.
 //
 // Official node behavior lives in the approval and condition packages. PostgreSQL durability and query projections
-// live in the optional postgres package. HTTP transports, Web UI, organization directories, authorization, and
-// projection presentation remain host responsibilities rather than core dependencies.
+// live in the optional postgres package, while MySQL command durability lives in the optional mysql package. HTTP
+// transports, Web UI, organization directories, authorization, and projection presentation remain host responsibilities
+// rather than core dependencies.
 package workflow

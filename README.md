@@ -8,7 +8,7 @@
 | --- | --- | --- | --- |
 | core | `github.com/lvpeng/easy-workflow` | canonical Definition、Builder、发布、Engine、`Store` 契约、`MemoryStore` | 只使用 Go 标准库；导入时不读配置、不连接网络、不启动 goroutine |
 | 官方 extension | `.../approval`、`.../condition` | 人工审批与受限 JSON 条件路由 | 只依赖 core；handler 必须显式注册 |
-| durable adapter | `.../postgres` | PostgreSQL command Store、迁移文件和独立查询投影 | 显式依赖 `pgx/v5`；连接、迁移和 pool 生命周期由宿主负责 |
+| durable adapter | `.../postgres`、`.../mysql` | PostgreSQL command Store、独立查询投影和 MySQL command Store | 数据库连接、迁移和 pool 生命周期由宿主负责；adapter 依赖按 package 显式选择 |
 | 可选 transport / Web integration | 由宿主应用实现 | HTTP、鉴权、DTO、Web UI、设计器和 Definition JSON 传输 | 不属于 core，也没有隐式默认实现 |
 
 组织目录同样不属于 core。`approval.OrganizationAdapter` 只是宿主可选实现的边界；静态 assignee 不需要目录。待办、已办和搜索属于 adapter 查询投影，不会扩张 command-side `workflow.Store`。
@@ -31,6 +31,7 @@
 | Definition 发布 | [`publication.go`](publication.go) | `DefinitionPublisher`、`Publish`、`PublishJSON` | 在持久化之前完整编译，并通过 `DefinitionVersionWriter` 分配严格递增的不可变版本 |
 | Instance 持久化接口 | [`store.go`](store.go) | `Store`、`MemoryStore` | Engine 的 command-side 存储端口；`Create` 创建实例，`Load` 读取快照，`Save` 做乐观并发 CAS |
 | PostgreSQL 持久化实现 | [`postgres/store.go`](postgres/store.go) | `postgres.New`、`Store.Create`、`Store.Load`、`Store.Save` | 使用宿主传入的 `pgxpool.Pool` 持久化完整 Instance 聚合 |
+| MySQL 持久化实现 | [`mysql/store.go`](mysql/store.go) | `mysql.New`、`Store.Create`、`Store.Load`、`Store.Save` | 使用宿主传入的 `*sql.DB` 持久化完整 Instance 聚合 |
 
 需要特别区分三个“创建”动作：
 
@@ -44,7 +45,7 @@
 
 ```text
 easy-workflow/
-├─ go.mod / go.sum                         # Go module、Go 版本和 pgx 依赖
+├─ go.mod / go.sum                         # Go module、Go 版本和 adapter 依赖
 ├─ README.md                               # 使用、架构、接入与运行说明
 ├─ LICENSE                                 # 许可证
 │
@@ -453,6 +454,31 @@ EASY_WORKFLOW_POSTGRES_DSN='postgres://user:password@localhost:5432/easy_workflo
 ```
 
 测试会为各场景创建随机隔离 schema，并覆盖公共 Store 契约、事务回滚、并发 CAS、pool 重启后的读取、完整快照恢复，以及 Projection 的 scope、稳定排序、opaque continuation、旧 Cursor 兼容、分页边界和事务可见性。未设置 `EASY_WORKFLOW_POSTGRES_DSN` 时，数据库相关用例会明确 skip。
+
+## MySQL durable adapter
+
+The optional `mysql` package implements the core command-side `workflow.Store` contract over a caller-owned
+`*sql.DB`. It does not connect or migrate during construction. Import a MySQL `database/sql` driver in the host,
+apply `mysql.Migrations()` with the host's migration tooling, then pass the opened handle to `mysql.New(db)`.
+
+```go
+import (
+	"database/sql"
+	_ "github.com/go-sql-driver/mysql"
+
+	workflowmysql "github.com/lvpeng/easy-workflow/mysql"
+)
+
+db, err := sql.Open("mysql", dsn)
+if err != nil {
+	return err
+}
+store := workflowmysql.New(db)
+```
+
+The MySQL adapter provides durable Instance, Task, and Audit snapshots with transactional CAS and append-only audit
+semantics. Indexed identifiers use case-sensitive utf8mb4 `VARCHAR(255)` columns; longer values are rejected before
+database I/O. It currently does not provide the PostgreSQL package's query projection API.
 
 ## 公开契约
 
