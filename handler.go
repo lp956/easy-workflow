@@ -43,9 +43,9 @@ type ActivationInput struct {
 
 // CommandInput supplies current node-owned state and tasks for one actor command.
 //
-// Tasks is a defensive copy containing the current node's complete active and historical task view. Handlers must echo
-// that complete view in NodeResult and may only advance active assignments according to Task's lifecycle contract;
-// mutating this slice cannot change the stored instance unless the engine accepts the result.
+// Payload, Data, State, and Tasks are defensive copies containing the command and current node's complete runtime view.
+// Handlers must echo the complete task view in NodeResult and may only advance active assignments according to Task's
+// lifecycle contract; mutating these values cannot change the stored instance unless the engine accepts the result.
 type CommandInput struct {
 	Command
 
@@ -66,8 +66,9 @@ type PreparedActivationInput struct {
 
 // PreparedCommandInput supplies runtime facts to one request-local prepared handler executor.
 //
-// Configuration is owned by the executor returned during Definition compilation. State and Tasks are defensive copies;
-// Tasks contains the current node's complete historical and active task view. Mutating inputs never changes Store state.
+// Configuration is owned by the executor returned during Definition compilation. Command.Payload, Data, State, and
+// Tasks are defensive copies; Tasks contains the current node's complete historical and active task view. Mutating
+// inputs never changes Store state or the caller's command buffer.
 type PreparedCommandInput struct {
 	Command
 

@@ -1,6 +1,6 @@
 # easy-workflow implementation issues
 
-这些本地 issue 从 [PRD](../PRD.md) 拆分，均标记为 `ready-for-agent`。仓库尚未配置远程 issue tracker，因此以 Markdown issue 集合保存；编号同时表示建议发布顺序，不代表所有工作必须串行执行。
+这些本地 issue 从 [项目说明](../README.md) 拆分，均标记为 `ready-for-agent`。仓库尚未配置远程 issue tracker，因此以 Markdown issue 集合保存；编号同时表示建议发布顺序，不代表所有工作必须串行执行。
 
 | ID | Title | Priority | Blocked by | User stories |
 |---|---|---|---|---|

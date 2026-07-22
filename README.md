@@ -116,12 +116,6 @@ easy-workflow/
 │  ├─ definition-repository-seams.md       # Definition 读写 capability 分离决策
 │  ├─ runtime-deep-modules.md              # NodeResult application 与配置准备决策
 │  └─ postgres-projection-continuations.md # Projection continuation 兼容决策
-├─ PRD.md                                  # 总体产品需求与范围
-├─ PRD-definition-compilation-module.md    # Definition 编译模块需求
-├─ PRD-definition-repository-seam.md       # Definition repository seam 需求
-├─ PRD-instance-audit-module.md            # Instance/Task/Audit 事实模块需求
-├─ PRD-postgres-projection-module.md       # PostgreSQL Projection 模块需求
-├─ go-workflow-research.md                 # 前期工作流方案调研
 └─ issues/                                 # 按依赖顺序保存的实现 issue 与交付记录
 ```
 
@@ -515,6 +509,9 @@ go test ./...
 go test -race ./...
 go vet ./...
 EASY_WORKFLOW_POSTGRES_DSN='...' go test ./postgres -count=1
+EASY_WORKFLOW_MYSQL_DSN='...' go test ./mysql -count=1
 ```
+
+The first three checks are local/static validation; the PostgreSQL and MySQL commands are explicit DSN-backed integration gates and are skipped when their DSN is not configured.
 
 前三项验证所有无外部基础设施的 package；最后一项是 P1 durable adapter 的显式集成门禁。

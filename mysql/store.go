@@ -22,14 +22,13 @@ const (
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	loadInstanceSQL = `
 		SELECT definition, status, initiator, current_node_id, data, node_state,
-		       tasks_is_nil, audit_is_nil, CAST(version AS CHAR)
+		tasks_is_nil, audit_is_nil, CAST(version AS CHAR)
 		FROM easy_workflow_instances
 		WHERE id = ?`
 	updateInstanceSQL = `
 		UPDATE easy_workflow_instances
 		SET definition = ?, status = ?, initiator = ?, current_node_id = ?,
-		    data = ?, node_state = ?, tasks_is_nil = ?, audit_is_nil = ?,
-		    version = ?
+		data = ?, node_state = ?, tasks_is_nil = ?, audit_is_nil = ?,version = ?
 		WHERE id = ? AND version = ?`
 	instanceExistsSQL = `SELECT 1 FROM easy_workflow_instances WHERE id = ? FOR UPDATE`
 	deleteTasksSQL    = `DELETE FROM easy_workflow_tasks WHERE instance_id = ?`
@@ -83,21 +82,21 @@ func (s *Store) Create(ctx context.Context, instance *workflow.Instance) error {
 
 	err = withTransaction(ctx, s.db, nil, func(tx *sql.Tx) error {
 		if _, execErr := tx.ExecContext(ctx, insertInstanceSQL, snapshot.parentArguments()...); execErr != nil {
-			if exists, classifyErr := instanceExists(ctx, tx, instance.ID); classifyErr == nil && exists {
-				return fmt.Errorf("%w: %q", workflow.ErrInstanceExists, instance.ID)
+			if exists, classifyErr := instanceExists(ctx, tx, snapshot.aggregate.ID); classifyErr == nil && exists {
+				return fmt.Errorf("%w: %q", workflow.ErrInstanceExists, snapshot.aggregate.ID)
 			}
 			return fmt.Errorf("insert instance row: %w", execErr)
 		}
-		if err := insertTasks(ctx, tx, instance.ID, snapshot.tasks); err != nil {
+		if err := insertTasks(ctx, tx, snapshot.aggregate.ID, snapshot.tasks); err != nil {
 			return err
 		}
-		if err := insertAudit(ctx, tx, instance.ID, snapshot.audit, 0); err != nil {
+		if err := insertAudit(ctx, tx, snapshot.aggregate.ID, snapshot.audit, 0); err != nil {
 			return err
 		}
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("mysql: create instance %q: %w", instance.ID, err)
+		return fmt.Errorf("mysql: create instance %q: %w", snapshot.aggregate.ID, err)
 	}
 	return nil
 }
@@ -158,21 +157,21 @@ func (s *Store) Save(ctx context.Context, instance *workflow.Instance, expectedV
 			return fmt.Errorf("read instance update count: %w", rowsErr)
 		}
 		if rowsAffected == 0 {
-			if err := classifyFailedCAS(ctx, tx, instance.ID, expectedVersion); err != nil {
+			if err := classifyFailedCAS(ctx, tx, snapshot.aggregate.ID, expectedVersion); err != nil {
 				return err
 			}
 		}
-		auditOffset, auditErr := validateAuditAppend(ctx, tx, instance.ID, instance.Audit)
+		auditOffset, auditErr := validateAuditAppend(ctx, tx, snapshot.aggregate.ID, snapshot.aggregate.Audit)
 		if auditErr != nil {
 			return auditErr
 		}
-		if err := replaceCollections(ctx, tx, instance.ID, snapshot, auditOffset); err != nil {
+		if err := replaceCollections(ctx, tx, snapshot.aggregate.ID, snapshot, auditOffset); err != nil {
 			return err
 		}
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("mysql: save instance %q: %w", instance.ID, err)
+		return fmt.Errorf("mysql: save instance %q: %w", snapshot.aggregate.ID, err)
 	}
 	return nil
 }
@@ -323,9 +322,22 @@ func withTransaction(ctx context.Context, db *sql.DB, options *sql.TxOptions, op
 		return fmt.Errorf("commit transaction: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit transaction: %w", err)
+		return fmt.Errorf("commit transaction: %w", classifyCommitError(ctx, err))
 	}
 	return nil
+}
+
+// classifyCommitError preserves request cancellation when database/sql reports a transaction that ended concurrently.
+//
+// err is the direct Commit result. ErrTxDone is ambiguous by itself because the context may have canceled immediately
+// before or during the driver commit; an observed context error is therefore the more useful stable public cause.
+func classifyCommitError(ctx context.Context, err error) error {
+	if errors.Is(err, sql.ErrTxDone) {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return contextErr
+		}
+	}
+	return err
 }
 
 // rollbackTransaction bounds how long a failed request waits for database/sql to finish driver cleanup. A driver that

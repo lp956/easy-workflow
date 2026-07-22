@@ -60,6 +60,34 @@ func TestMigrationsExposeQueryProjection(t *testing.T) {
 	}
 }
 
+// TestMigrationsExposeQueryProjectionBackfill verifies the upgrade and its explicitly documented irreversible down step.
+func TestMigrationsExposeQueryProjectionBackfill(t *testing.T) {
+	t.Parallel()
+
+	up, err := fs.ReadFile(postgres.Migrations(), "migrations/0003_query_projection_backfill.up.sql")
+	if err != nil {
+		t.Fatalf("ReadFile(up) error = %v", err)
+	}
+	for _, fragment := range []string{
+		"easy_workflow_instances",
+		"easy_workflow_audit",
+		"easy_workflow_instance_projection",
+		"easy_workflow_participation_projection",
+		"ON CONFLICT",
+	} {
+		if !strings.Contains(string(up), fragment) {
+			t.Errorf("projection backfill migration does not contain %q", fragment)
+		}
+	}
+	down, err := fs.ReadFile(postgres.Migrations(), "migrations/0003_query_projection_backfill.down.sql")
+	if err != nil {
+		t.Fatalf("ReadFile(down) error = %v", err)
+	}
+	if !strings.Contains(string(down), "irreversible") {
+		t.Errorf("projection backfill down migration = %q, want irreversible rationale", down)
+	}
+}
+
 // TestNewReturnsStore verifies that explicit pool injection constructs the public workflow Store adapter.
 func TestNewReturnsStore(t *testing.T) {
 	t.Parallel()

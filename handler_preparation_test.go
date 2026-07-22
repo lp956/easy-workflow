@@ -171,6 +171,10 @@ func (e *preparedProbeExecution) HandlePrepared(
 	if e.role != "first" {
 		return workflow.NodeResult{}, workflow.ErrInvalidCommand
 	}
+	// The opt-in command mutates its payload so the Engine boundary test can verify handler ownership.
+	if input.Name == "mutate-payload" && len(input.Payload) > 0 {
+		input.Payload[0] = 'X'
+	}
 	tasks := slices.Clone(input.Tasks)
 	for index := range tasks {
 		if tasks[index].ID == input.TaskID {
@@ -347,14 +351,19 @@ func TestEnginePreparesHandlerConfigOncePerExecutablePlan(t *testing.T) {
 	}
 
 	// Handle defensively recompiles the persisted snapshot, then reuses that plan for first.Handle and second.Activate.
+	payload := json.RawMessage(`{"decision":"next"}`)
 	instance, err = engine.Handle(t.Context(), workflow.Command{
 		InstanceID: instance.ID,
 		TaskID:     instance.Tasks[0].ID,
 		ActorID:    instance.Tasks[0].Assignee,
-		Name:       "decide",
+		Name:       "mutate-payload",
+		Payload:    payload,
 	})
 	if err != nil {
 		t.Fatalf("Handle() error = %v", err)
+	}
+	if !slices.Equal(payload, json.RawMessage(`{"decision":"next"}`)) {
+		t.Errorf("caller payload = %s, want unchanged JSON", payload)
 	}
 	if instance.Status != workflow.InstanceStatusCompleted || instance.CurrentNodeID != "end" {
 		t.Fatalf("instance status/node = %q/%q, want completed/end", instance.Status, instance.CurrentNodeID)
@@ -382,6 +391,59 @@ func TestEnginePreparesHandlerConfigOncePerExecutablePlan(t *testing.T) {
 	}
 	if !slices.Equal(persistedJSON, canonicalJSON) {
 		t.Errorf("persisted Definition JSON = %s, want canonical %s", persistedJSON, canonicalJSON)
+	}
+}
+
+// TestCompileChecksStartRoutesBeforePreparingHandlers verifies unusable startup routing has no handler side effects.
+func TestCompileChecksStartRoutesBeforePreparingHandlers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		edges []workflow.Edge
+	}{
+		{
+			name: "named-only route",
+			edges: []workflow.Edge{
+				{From: "start", To: "task", Outcome: "named"},
+				{From: "task", To: "end", Outcome: "done"},
+			},
+		},
+		{
+			name: "multiple start routes",
+			edges: []workflow.Edge{
+				{From: "start", To: "task"},
+				{From: "start", To: "end", Outcome: "named"},
+				{From: "task", To: "end", Outcome: "done"},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			handler := &preparedProbeHandler{}
+			registry := workflow.NewRegistry()
+			if err := registry.Register(preparedProbeKind, handler); err != nil {
+				t.Fatalf("Register() error = %v", err)
+			}
+			definition := &workflow.Definition{
+				ID: "invalid-start-" + test.name,
+				Nodes: []workflow.NodeDefinition{
+					{ID: "start", Kind: workflow.KindStart},
+					{ID: "task", Kind: preparedProbeKind, Config: json.RawMessage(`"first"`)},
+					{ID: "end", Kind: workflow.KindEnd},
+				},
+				Edges: test.edges,
+			}
+			if err := workflow.CompileDefinition(definition, registry); !errors.Is(err, workflow.ErrInvalidDefinition) {
+				t.Fatalf("CompileDefinition() error = %v, want ErrInvalidDefinition", err)
+			}
+			prepares, _, _, _ := handler.counts()
+			if len(prepares) != 0 {
+				t.Fatalf("PrepareConfig() calls = %#v, want none", prepares)
+			}
+		})
 	}
 }
 

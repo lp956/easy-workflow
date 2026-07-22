@@ -7,7 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	workflow "github.com/lvpeng/easy-workflow"
 	"github.com/lvpeng/easy-workflow/condition"
@@ -330,6 +333,71 @@ func TestValidateRejectsInvalidConfig(t *testing.T) {
 				t.Fatalf("Validate() error = %v, want ErrInvalidConfig", err)
 			}
 		})
+	}
+}
+
+// TestValidateRejectsUnrepresentableNumbers verifies publication rejects exponents outside exact rational support.
+func TestValidateRejectsUnrepresentableNumbers(t *testing.T) {
+	t.Parallel()
+
+	config := json.RawMessage(`{"rules":[{"match":"all","conditions":[{"field":"/amount","type":"number","operator":"eq","value":1e1000001}],"outcome":"matched"}]}`)
+	if err := condition.NewHandler().Validate(config); !errors.Is(err, condition.ErrInvalidConfig) {
+		t.Fatalf("Validate(huge exponent) error = %v, want ErrInvalidConfig", err)
+	}
+}
+
+// TestActivateClassifiesUnrepresentableBusinessNumbersAsInvalidData verifies runtime payloads cannot become config errors.
+func TestActivateClassifiesUnrepresentableBusinessNumbersAsInvalidData(t *testing.T) {
+	t.Parallel()
+
+	config := json.RawMessage(`{"rules":[{"match":"all","conditions":[{"field":"/amount","type":"number","operator":"eq","value":1}],"outcome":"matched"}]}`)
+	_, err := condition.NewHandler().Activate(context.Background(), workflow.ActivationInput{
+		Config: config,
+		Data:   json.RawMessage(`{"amount":1e1000001}`),
+	})
+	if !errors.Is(err, condition.ErrInvalidData) {
+		t.Fatalf("Activate(huge business exponent) error = %v, want ErrInvalidData", err)
+	}
+}
+
+// cancelAfterErrContext makes cancellation observable during evaluation after a bounded number of checks.
+type cancelAfterErrContext struct {
+	calls      atomic.Int32
+	cancelAt   int32
+	done       chan struct{}
+	cancelOnce sync.Once
+}
+
+// Deadline reports that this deterministic test context has no time-based deadline.
+func (*cancelAfterErrContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+
+// Done exposes cancellation after the configured Err observation.
+func (c *cancelAfterErrContext) Done() <-chan struct{} { return c.done }
+
+// Err returns context.Canceled from the configured observation onward.
+func (c *cancelAfterErrContext) Err() error {
+	if c.calls.Add(1) < c.cancelAt {
+		return nil
+	}
+	c.cancelOnce.Do(func() { close(c.done) })
+	return context.Canceled
+}
+
+// Value reports no request-scoped values because the test only exercises cancellation propagation.
+func (*cancelAfterErrContext) Value(any) any { return nil }
+
+// TestActivateChecksContextDuringRuleEvaluation verifies a cancellation after decoding stops later expressions.
+func TestActivateChecksContextDuringRuleEvaluation(t *testing.T) {
+	t.Parallel()
+
+	config := json.RawMessage(`{"rules":[{"match":"all","conditions":[{"field":"/first","type":"boolean","operator":"eq","value":true},{"field":"/second","type":"boolean","operator":"eq","value":true}],"outcome":"matched"}]}`)
+	ctx := &cancelAfterErrContext{cancelAt: 4, done: make(chan struct{})}
+	_, err := condition.NewHandler().Activate(ctx, workflow.ActivationInput{
+		Config: config,
+		Data:   json.RawMessage(`{"first":true,"second":true}`),
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Activate(canceled during evaluation) error = %v, want context.Canceled", err)
 	}
 }
 

@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 
 	"github.com/jackc/pgx/v5"
 
 	workflow "github.com/lvpeng/easy-workflow"
+	"github.com/lvpeng/easy-workflow/internal/jsonstrict"
 )
 
 // storedDefinition preserves raw node configuration bytes instead of applying JSONB normalization.
@@ -31,6 +33,8 @@ type storedNode struct {
 
 // encodedSnapshot contains detached parent and collection payloads ready for one database transaction.
 type encodedSnapshot struct {
+	// aggregate is the detached high-level candidate used by validation and every child/projection write.
+	aggregate     workflow.Instance
 	id            workflow.InstanceID
 	definition    []byte
 	status        workflow.InstanceStatus
@@ -45,34 +49,57 @@ type encodedSnapshot struct {
 	audit         [][]byte
 }
 
-// encodeSnapshot creates lossless byte payloads without retaining caller-owned mutable slices.
+// encodeSnapshot clones the candidate once, then creates lossless row payloads from that detached aggregate.
 func encodeSnapshot(instance *workflow.Instance) (encodedSnapshot, error) {
-	definition, err := encodeDefinition(instance.Definition)
+	// Detach all aggregate fields before any payload encoding so later transaction steps share one candidate.
+	aggregate := cloneAggregate(instance)
+	// Serialize the detached definition and ordered facts for the parent and child database rows.
+	definition, err := encodeDefinition(aggregate.Definition)
 	if err != nil {
 		return encodedSnapshot{}, err
 	}
-	tasks, err := encodeValues(instance.Tasks)
+	tasks, err := encodeValues(aggregate.Tasks)
 	if err != nil {
 		return encodedSnapshot{}, fmt.Errorf("encode tasks: %w", err)
 	}
-	audit, err := encodeValues(instance.Audit)
+	audit, err := encodeValues(aggregate.Audit)
 	if err != nil {
 		return encodedSnapshot{}, fmt.Errorf("encode audit: %w", err)
 	}
 	return encodedSnapshot{
-		id:            instance.ID,
+		aggregate:     aggregate,
+		id:            aggregate.ID,
 		definition:    definition,
-		status:        instance.Status,
-		initiator:     instance.Initiator,
-		currentNodeID: instance.CurrentNodeID,
-		data:          cloneBytes(instance.Data),
-		nodeState:     cloneBytes(instance.NodeState),
-		tasksNil:      instance.Tasks == nil,
-		auditNil:      instance.Audit == nil,
-		version:       instance.Version,
+		status:        aggregate.Status,
+		initiator:     aggregate.Initiator,
+		currentNodeID: aggregate.CurrentNodeID,
+		data:          cloneBytes(aggregate.Data),
+		nodeState:     cloneBytes(aggregate.NodeState),
+		tasksNil:      aggregate.Tasks == nil,
+		auditNil:      aggregate.Audit == nil,
+		version:       aggregate.Version,
 		tasks:         tasks,
 		audit:         audit,
 	}, nil
+}
+
+// cloneAggregate detaches every mutable field needed after encoding, including nested definition configuration bytes.
+func cloneAggregate(source *workflow.Instance) workflow.Instance {
+	cloned := *source
+
+	// Copy the graph and each raw configuration so later persistence steps cannot observe caller-owned definition data.
+	cloned.Definition.Nodes = slices.Clone(source.Definition.Nodes)
+	for index := range cloned.Definition.Nodes {
+		cloned.Definition.Nodes[index].Config = slices.Clone(source.Definition.Nodes[index].Config)
+	}
+	cloned.Definition.Edges = slices.Clone(source.Definition.Edges)
+
+	// Copy opaque payloads and ordered facts so the transaction uses one immutable candidate snapshot.
+	cloned.Data = cloneBytes(source.Data)
+	cloned.NodeState = cloneBytes(source.NodeState)
+	cloned.Tasks = slices.Clone(source.Tasks)
+	cloned.Audit = slices.Clone(source.Audit)
+	return cloned
 }
 
 // parentArguments returns parameter values for one insert without interpolating workflow data into SQL.
@@ -281,8 +308,8 @@ func encodeValues[T any](values []T) ([][]byte, error) {
 
 // decodeJSON decodes one complete trusted durable payload and rejects trailing bytes.
 func decodeJSON(data []byte, target any) error {
-	if err := json.Unmarshal(data, target); err != nil {
-		return fmt.Errorf("unmarshal durable payload: %w", err)
+	if err := jsonstrict.Decode(data, target); err != nil {
+		return fmt.Errorf("decode durable payload: %w", err)
 	}
 	return nil
 }

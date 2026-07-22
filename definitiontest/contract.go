@@ -18,6 +18,8 @@ var (
 	errIncompleteConcurrentDefinition = errors.New("incomplete concurrent Definition snapshot")
 	// errNilConcurrentDefinition classifies an absent snapshot returned during a successful concurrent lookup.
 	errNilConcurrentDefinition = errors.New("concurrent Definition snapshot is nil")
+	// errNilPublishedDefinition classifies a successful writer call that returned no snapshot for the contract to inspect.
+	errNilPublishedDefinition = errors.New("published Definition snapshot is nil")
 )
 
 // WriterFactory creates an isolated DefinitionVersionWriter for one contract subtest.
@@ -172,6 +174,26 @@ func runRepositoryFailureAtomicityContract(t *testing.T, factory RepositoryFacto
 		t.Fatalf("Load(version 1) after failure error = %v", err)
 	}
 	assertContractDefinition(t, loaded, "repository-failure", 1, "end-success")
+
+	// A failed append after version one must also preserve the existing latest snapshot and leave version two unused.
+	canceledAppend, cancelAppend := context.WithCancel(t.Context())
+	cancelAppend()
+	if _, err := writer.CreateVersion(canceledAppend, contractDefinition("repository-failure", "end-failed-append")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled append CreateVersion() error = %v, want context.Canceled", err)
+	}
+	latestAfterFailure, err := reader.LoadLatest(t.Context(), "repository-failure")
+	if err != nil {
+		t.Fatalf("LoadLatest() after canceled append error = %v", err)
+	}
+	assertContractDefinition(t, latestAfterFailure, "repository-failure", 1, "end-success")
+	if _, err := writer.CreateVersion(t.Context(), contractDefinition("repository-failure", "end-second-success")); err != nil {
+		t.Fatalf("CreateVersion() after canceled append error = %v", err)
+	}
+	loaded, err = reader.Load(t.Context(), "repository-failure", 2)
+	if err != nil {
+		t.Fatalf("Load(version 2) after canceled append error = %v", err)
+	}
+	assertContractDefinition(t, loaded, "repository-failure", 2, "end-second-success")
 }
 
 // runRepositoryOwnershipContract verifies every write and read boundary returns detached mutable data.
@@ -297,6 +319,11 @@ func runReaderLookupContract(t *testing.T, factory ReaderFactory) {
 		t.Fatalf("Load(version 1) error = %v", err)
 	}
 	assertContractDefinition(t, exact, "reader-a", 1, "end-a-v1")
+	exact, err = reader.Load(t.Context(), "reader-a", 2)
+	if err != nil {
+		t.Fatalf("Load(version 2) error = %v", err)
+	}
+	assertContractDefinition(t, exact, "reader-a", 2, "end-a-v2")
 	latest, err := reader.LoadLatest(t.Context(), "reader-a")
 	if err != nil {
 		t.Fatalf("LoadLatest() error = %v", err)
@@ -453,8 +480,12 @@ func runReaderConcurrencyContract(t *testing.T, factory ReaderFactory) {
 				readErrors <- err
 				return
 			}
-			if exact.Version != 1 || exact.Nodes[2].ID != "end-v1" || latest.Version != 2 || latest.Nodes[2].ID != "end-v2" {
-				readErrors <- fmt.Errorf("%w: exact %#v latest %#v", errIncompleteConcurrentDefinition, exact, latest)
+			if err := validateReaderSnapshot(exact, "concurrent-reader", 1, "end-v1"); err != nil {
+				readErrors <- err
+				return
+			}
+			if err := validateReaderSnapshot(latest, "concurrent-reader", 2, "end-v2"); err != nil {
+				readErrors <- err
 			}
 		}()
 	}
@@ -493,6 +524,9 @@ func runWriterFailureAtomicityContract(t *testing.T, factory WriterFactory) {
 	if err != nil {
 		t.Fatalf("CreateVersion() after failures error = %v", err)
 	}
+	if published == nil {
+		t.Fatal(errNilPublishedDefinition)
+	}
 	if published.Version != 1 {
 		t.Fatalf("CreateVersion() after failures version = %d, want 1", published.Version)
 	}
@@ -511,6 +545,9 @@ func runWriterOwnershipContract(t *testing.T, factory WriterFactory) {
 	published, err := writer.CreateVersion(t.Context(), input)
 	if err != nil {
 		t.Fatalf("CreateVersion() error = %v", err)
+	}
+	if published == nil {
+		t.Fatal(errNilPublishedDefinition)
 	}
 
 	// Mutating the caller input after success must not alter the writer result snapshot.
@@ -551,6 +588,10 @@ func runWriterConcurrencyContract(t *testing.T, factory WriterFactory) {
 			published, err := writer.CreateVersion(t.Context(), contractDefinition("concurrent-writer", "end"))
 			if err != nil {
 				errorsByCall <- err
+				return
+			}
+			if published == nil {
+				errorsByCall <- errNilPublishedDefinition
 				return
 			}
 			versions <- published.Version
@@ -601,6 +642,9 @@ func runWriterVersionAllocationContract(t *testing.T, factory WriterFactory) {
 	independent, err := writer.CreateVersion(t.Context(), contractDefinition("definition-b", "end-b-v1"))
 	if err != nil {
 		t.Fatalf("independent CreateVersion() error = %v", err)
+	}
+	if first == nil || second == nil || independent == nil {
+		t.Fatal(errNilPublishedDefinition)
 	}
 	if first.Version != 1 || second.Version != 2 || independent.Version != 1 {
 		t.Fatalf(
@@ -726,6 +770,22 @@ func validateConcurrentSnapshot(definition *workflow.Definition, maxVersion uint
 		definition.Nodes[0].ID != "start" || definition.Nodes[1].Config[0] != '{' ||
 		definition.Nodes[2].ID != "end-stable" || definition.Edges[0].To != "task" {
 		return fmt.Errorf("%w: %#v", errIncompleteConcurrentDefinition, definition)
+	}
+	return nil
+}
+
+// validateReaderSnapshot checks one exact reader result before any concurrent assertion indexes its graph.
+//
+// definition may be nil or partial when a non-conforming adapter reports success. The helper returns a descriptive
+// error instead of panicking in a reader goroutine, allowing the parent test to report one deterministic failure.
+func validateReaderSnapshot(definition *workflow.Definition, id string, version uint64, endID string) error {
+	if definition == nil {
+		return errNilConcurrentDefinition
+	}
+	if definition.ID != id || definition.Version != version || len(definition.Nodes) != 3 || len(definition.Edges) != 2 ||
+		len(definition.Nodes[1].Config) == 0 || definition.Nodes[0].ID != "start" || definition.Nodes[1].Config[0] != '{' ||
+		definition.Nodes[2].ID != endID || definition.Edges[0].To != "task" {
+		return fmt.Errorf("%w: got %#v, want %q version %d ending at %q", errIncompleteConcurrentDefinition, definition, id, version, endID)
 	}
 	return nil
 }

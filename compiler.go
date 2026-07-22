@@ -115,6 +115,28 @@ func compileDefinition(definition *Definition, registry *Registry) (*compiledDef
 		}
 	}
 
+	// Engine startup always selects the empty outcome, so a named-only start edge is not executable.
+	if _, exists := plan.routes[edgeSelector{source: plan.startID}]; !exists {
+		return nil, fmt.Errorf(
+			"%w: %w: definition %q node %q outcome %q",
+			ErrInvalidDefinition,
+			ErrRouteNotFound,
+			plan.definition.ID,
+			plan.startID,
+			"",
+		)
+	}
+	// The unconditional selector is the sole runtime Start result, so every additional outgoing edge would be dead config.
+	if len(analysis.adjacency[plan.startID]) != 1 {
+		return nil, fmt.Errorf(
+			"%w: definition %q start node %q has %d outgoing routes; want one unconditional route",
+			ErrInvalidDefinition,
+			plan.definition.ID,
+			plan.startID,
+			len(analysis.adjacency[plan.startID]),
+		)
+	}
+
 	// Resolve and prepare handler-owned configuration only after canonical syntax is known to be sound.
 	for index := range plan.definition.Nodes {
 		node := &plan.definition.Nodes[index]
@@ -152,27 +174,6 @@ func compileDefinition(definition *Definition, registry *Registry) (*compiledDef
 		plan.nodes[node.ID] = compiled
 	}
 
-	// Engine startup always selects the empty outcome, so a named-only start edge is not executable.
-	if _, exists := plan.routes[edgeSelector{source: plan.startID}]; !exists {
-		return nil, fmt.Errorf(
-			"%w: %w: definition %q node %q outcome %q",
-			ErrInvalidDefinition,
-			ErrRouteNotFound,
-			plan.definition.ID,
-			plan.startID,
-			"",
-		)
-	}
-	// The unconditional selector is the sole runtime Start result, so every additional outgoing edge would be dead config.
-	if len(analysis.adjacency[plan.startID]) != 1 {
-		return nil, fmt.Errorf(
-			"%w: definition %q start node %q has %d outgoing routes; want one unconditional route",
-			ErrInvalidDefinition,
-			plan.definition.ID,
-			plan.startID,
-			len(analysis.adjacency[plan.startID]),
-		)
-	}
 	return plan, nil
 }
 

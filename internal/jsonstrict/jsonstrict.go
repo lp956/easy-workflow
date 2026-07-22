@@ -28,12 +28,7 @@ var (
 // reject unknown fields, while map and interface targets retain their natural open shape. JSON numbers decode as
 // json.Number. Errors wrap ErrInvalid, and neither input bytes nor decoded mutable values are retained by this package.
 func Decode(data []byte, target any) error {
-	// encoding/json replaces malformed source bytes with U+FFFD, which would erase the caller's original meaning.
-	if !utf8.Valid(data) {
-		return fmt.Errorf("%w: source is not valid UTF-8", ErrInvalid)
-	}
-	// Token validation runs first because encoding/json otherwise accepts duplicate object names with last-value-wins.
-	if err := validateUniqueValue(data); err != nil {
+	if err := Validate(data); err != nil {
 		return err
 	}
 	// Validate member names against the exact typed schema before encoding/json can apply case-insensitive field matching.
@@ -55,6 +50,112 @@ func Decode(data []byte, target any) error {
 		return fmt.Errorf("%w: read trailing data: %w", ErrInvalid, err)
 	}
 	return nil
+}
+
+// Validate checks one complete JSON value without applying a target schema.
+//
+// data must contain valid UTF-8 and exactly one JSON value. The validation rejects duplicate object members,
+// malformed surrogate escape sequences, trailing values, and syntax errors. It performs no decoding into caller-owned
+// values, so it is suitable for open JSON payload boundaries that still require one lossless interpretation.
+func Validate(data []byte) error {
+	// encoding/json replaces malformed source bytes and accepts lone UTF-16 surrogate escapes; both behaviors lose the
+	// distinction between the original input and the decoded replacement character.
+	if !utf8.Valid(data) {
+		return fmt.Errorf("%w: source is not valid UTF-8", ErrInvalid)
+	}
+	if err := validateEscapedSurrogates(data); err != nil {
+		return err
+	}
+	// Token validation also proves the value is syntactically complete and rejects last-member-wins ambiguity.
+	return validateUniqueValue(data)
+}
+
+// validateEscapedSurrogates enforces JSON's UTF-16 escape pairing rules before encoding/json decodes strings.
+//
+// data must be valid UTF-8; the scan only interprets bytes inside JSON strings and leaves general syntax validation to
+// encoding/json. A high surrogate must be immediately followed by a low-surrogate escape, and a low surrogate may
+// never appear without that preceding pair. The scan allocates no decoded strings or runes.
+func validateEscapedSurrogates(data []byte) error {
+	insideString := false
+	for index := 0; index < len(data); index++ {
+		if !insideString {
+			if data[index] == '"' {
+				insideString = true
+			}
+			continue
+		}
+		if data[index] == '"' {
+			insideString = false
+			continue
+		}
+		if data[index] != '\\' {
+			continue
+		}
+		// Skip the escaped byte itself; malformed escape syntax is reported by the token decoder later.
+		if index+1 >= len(data) {
+			continue
+		}
+		if data[index+1] != 'u' {
+			index++
+			continue
+		}
+		if index+5 >= len(data) {
+			return fmt.Errorf("%w: incomplete Unicode escape", ErrInvalid)
+		}
+		value, ok := decodeHexEscape(data[index+2 : index+6])
+		if !ok {
+			return fmt.Errorf("%w: invalid Unicode escape", ErrInvalid)
+		}
+		switch {
+		case isHighSurrogate(value):
+			// A high surrogate is valid only as the first half of one adjacent escaped pair.
+			if index+11 >= len(data) || data[index+6] != '\\' || data[index+7] != 'u' {
+				return fmt.Errorf("%w: high surrogate is not paired", ErrInvalid)
+			}
+			low, lowOK := decodeHexEscape(data[index+8 : index+12])
+			if !lowOK || !isLowSurrogate(low) {
+				return fmt.Errorf("%w: high surrogate is followed by a non-low surrogate", ErrInvalid)
+			}
+			index += 11
+		case isLowSurrogate(value):
+			return fmt.Errorf("%w: low surrogate has no high-surrogate pair", ErrInvalid)
+		default:
+			index += 5
+		}
+	}
+	return nil
+}
+
+// decodeHexEscape decodes exactly four hexadecimal bytes without accepting a partial escape.
+func decodeHexEscape(data []byte) (uint16, bool) {
+	if len(data) != 4 {
+		return 0, false
+	}
+	var value uint16
+	for _, digit := range data {
+		value <<= 4
+		switch {
+		case digit >= '0' && digit <= '9':
+			value |= uint16(digit - '0')
+		case digit >= 'a' && digit <= 'f':
+			value |= uint16(digit-'a') + 10
+		case digit >= 'A' && digit <= 'F':
+			value |= uint16(digit-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return value, true
+}
+
+// isHighSurrogate reports whether value is the first half of a UTF-16 surrogate pair.
+func isHighSurrogate(value uint16) bool {
+	return value >= 0xD800 && value <= 0xDBFF
+}
+
+// isLowSurrogate reports whether value is the second half of a UTF-16 surrogate pair.
+func isLowSurrogate(value uint16) bool {
+	return value >= 0xDC00 && value <= 0xDFFF
 }
 
 // validateExactSchema compares every closed-struct object member with its exact JSON field name.

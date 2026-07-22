@@ -180,7 +180,7 @@ func (h *Handler) Activate(ctx context.Context, input workflow.ActivationInput) 
 	if err != nil {
 		return workflow.NodeResult{}, err
 	}
-	return activateConfig(config, input.Data)
+	return activateConfig(ctx, config, input.Data)
 }
 
 // ActivatePrepared evaluates business data with rules decoded during executable-plan compilation.
@@ -194,14 +194,17 @@ func (h *preparedHandler) ActivatePrepared(
 	if err := ctx.Err(); err != nil {
 		return workflow.NodeResult{}, fmt.Errorf("condition: activate: %w", err)
 	}
-	return activateConfig(h.config, input.Data)
+	return activateConfig(ctx, h.config, input.Data)
 }
 
 // activateConfig evaluates every validated rule against one detached business-data JSON object.
 //
 // config must come from parseConfig and data must encode a non-nil object. Exactly one match returns Continue; no match
 // uses DefaultOutcome or ErrNoMatch, and overlaps return ErrMultipleMatches. The function retains no input and performs no I/O.
-func activateConfig(config Config, dataJSON json.RawMessage) (workflow.NodeResult, error) {
+func activateConfig(ctx context.Context, config Config, dataJSON json.RawMessage) (workflow.NodeResult, error) {
+	if err := ctx.Err(); err != nil {
+		return workflow.NodeResult{}, fmt.Errorf("condition: activate: %w", err)
+	}
 
 	// Decode business data into fresh storage so evaluation cannot mutate or retain Engine-owned bytes.
 	var data map[string]any
@@ -211,11 +214,14 @@ func activateConfig(config Config, dataJSON json.RawMessage) (workflow.NodeResul
 	if data == nil {
 		return workflow.NodeResult{}, fmt.Errorf("%w: JSON object required", ErrInvalidData)
 	}
+	if err := ctx.Err(); err != nil {
+		return workflow.NodeResult{}, fmt.Errorf("condition: activate: %w", err)
+	}
 	// Evaluate every rule before selecting an outcome so rule slice order can never choose the winner.
 	matchedOutcome := ""
 	matchCount := 0
 	for _, rule := range config.Rules {
-		matched, evalErr := evaluateRule(rule, data)
+		matched, evalErr := evaluateRule(ctx, rule, data)
 		if evalErr != nil {
 			return workflow.NodeResult{}, evalErr
 		}
@@ -307,10 +313,13 @@ func decodeConfig(data []byte, target *Config) error {
 // rule must have MatchAll or MatchAny and at least one expression. Missing fields and type mismatches are
 // returned rather than treated as false. Every expression is evaluated before the boolean combination is returned,
 // making validation errors independent of condition order.
-func evaluateRule(rule Rule, data map[string]any) (bool, error) {
+func evaluateRule(ctx context.Context, rule Rule, data map[string]any) (bool, error) {
 	matchedCount := 0
 	for _, expression := range rule.Conditions {
-		matched, err := evaluateExpression(expression, data)
+		if err := ctx.Err(); err != nil {
+			return false, fmt.Errorf("condition: evaluate rule: %w", err)
+		}
+		matched, err := evaluateExpression(ctx, expression, data)
 		if err != nil {
 			return false, err
 		}
@@ -329,7 +338,10 @@ func evaluateRule(rule Rule, data map[string]any) (bool, error) {
 // data must be a decoded JSON object whose numbers remain json.Number values. Missing fields return
 // ErrFieldNotFound; wrong runtime value types return ErrTypeMismatch rather than being coerced. The function
 // is deterministic and has no side effects.
-func evaluateExpression(expression Expression, data map[string]any) (bool, error) {
+func evaluateExpression(ctx context.Context, expression Expression, data map[string]any) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, fmt.Errorf("condition: evaluate expression: %w", err)
+	}
 	value, exists := lookupField(data, expression.Field)
 	if !exists {
 		return false, fmt.Errorf("%w: %s", ErrFieldNotFound, expression.Field)
@@ -344,7 +356,7 @@ func evaluateExpression(expression Expression, data map[string]any) (bool, error
 	case TypeBoolean:
 		return evaluateBoolean(value, expression)
 	case TypeCollection:
-		return evaluateCollection(value, expression)
+		return evaluateCollection(ctx, value, expression)
 	}
 	return false, fmt.Errorf("%w: unsupported type or operator", ErrInvalidConfig)
 }
@@ -393,10 +405,15 @@ func evaluateNumber(value any, expression Expression) (bool, error) {
 	if !ok {
 		return false, fmt.Errorf("%w: number comparison value changed after validation", ErrInvalidConfig)
 	}
-	comparison, err := compareNumbers(actual, expected)
+	actualValue, err := parseConditionNumber(actual)
+	if err != nil {
+		return false, fmt.Errorf("%w: field %s: %w", ErrInvalidData, expression.Field, err)
+	}
+	expectedValue, err := parseConditionNumber(expected)
 	if err != nil {
 		return false, fmt.Errorf("%w: field %s: %w", ErrInvalidConfig, expression.Field, err)
 	}
+	comparison := actualValue.Cmp(expectedValue)
 	switch expression.Operator {
 	case OperatorEqual:
 		return comparison == 0, nil
@@ -445,15 +462,32 @@ func evaluateBoolean(value any, expression Expression) (bool, error) {
 //
 // value must be []any containing only supported primitives. expression.Value must retain its validated scalar or
 // non-empty array shape. Comparisons are type-strict; malformed runtime or configuration values return errors.
-func evaluateCollection(value any, expression Expression) (bool, error) {
+func evaluateCollection(ctx context.Context, value any, expression Expression) (bool, error) {
 	actual, ok := value.([]any)
 	if !ok {
 		return false, fmt.Errorf("%w: field %s is not a collection", ErrTypeMismatch, expression.Field)
 	}
-	if slices.ContainsFunc(actual, func(member any) bool { return !isPrimitive(member) }) {
-		return false, fmt.Errorf("%w: field %s contains a non-primitive member", ErrTypeMismatch, expression.Field)
+	for _, member := range actual {
+		if err := ctx.Err(); err != nil {
+			return false, fmt.Errorf("condition: evaluate collection: %w", err)
+		}
+		if !isPrimitive(member) {
+			return false, fmt.Errorf("%w: field %s contains a non-primitive member", ErrTypeMismatch, expression.Field)
+		}
+		if number, isNumber := member.(json.Number); isNumber {
+			if _, err := parseConditionNumber(number); err != nil {
+				return false, fmt.Errorf("%w: field %s: %w", ErrInvalidData, expression.Field, err)
+			}
+		}
 	}
-	return compareCollection(actual, expression.Operator, expression.Value)
+	matched, err := compareCollection(ctx, actual, expression.Operator, expression.Value)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrInvalidConfig) {
+			return false, err
+		}
+		return false, fmt.Errorf("%w: field %s: %w", ErrInvalidData, expression.Field, err)
+	}
+	return matched, nil
 }
 
 // parsePointer validates and decodes a non-root RFC 6901 JSON Pointer into object-key tokens.
@@ -548,8 +582,12 @@ func validateStringExpression(expression Expression) error {
 
 // validateNumberExpression checks the literal type and ordered-comparison allow-list for exact JSON numbers.
 func validateNumberExpression(expression Expression) error {
-	if _, ok := expression.Value.(json.Number); !ok {
+	number, ok := expression.Value.(json.Number)
+	if !ok {
 		return fmt.Errorf("%w: value must be a number", ErrInvalidConfig)
+	}
+	if _, err := parseConditionNumber(number); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 	if expression.Operator != OperatorEqual && expression.Operator != OperatorNotEqual &&
 		expression.Operator != OperatorGreaterThan && expression.Operator != OperatorGreaterOrEqual &&
@@ -579,6 +617,9 @@ func validateCollectionExpression(expression Expression) error {
 		if !isPrimitive(expression.Value) {
 			return fmt.Errorf("%w: contains value must be a JSON primitive", ErrInvalidConfig)
 		}
+		if err := validateConditionPrimitive(expression.Value); err != nil {
+			return err
+		}
 		return nil
 	}
 	if expression.Operator != OperatorContainsAny && expression.Operator != OperatorContainsAll {
@@ -591,6 +632,24 @@ func validateCollectionExpression(expression Expression) error {
 	if slices.ContainsFunc(values, func(value any) bool { return !isPrimitive(value) }) {
 		return fmt.Errorf("%w: collection comparison values must be JSON primitives", ErrInvalidConfig)
 	}
+	for _, value := range values {
+		if err := validateConditionPrimitive(value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateConditionPrimitive validates the exact numeric representation used by a collection operand.
+//
+// value must already be one of the JSON primitive types accepted by isPrimitive. Strings and booleans need no further
+// work; json.Number is parsed now so malformed or resource-exhausting numeric configuration fails before publication.
+func validateConditionPrimitive(value any) error {
+	if number, ok := value.(json.Number); ok {
+		if _, err := parseConditionNumber(number); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+		}
+	}
 	return nil
 }
 
@@ -599,15 +658,27 @@ func validateCollectionExpression(expression Expression) error {
 // left and right must retain their original JSON number text. The result is negative, zero, or positive when
 // left is respectively less than, equal to, or greater than right. Invalid text returns an error.
 func compareNumbers(left, right json.Number) (int, error) {
-	leftValue, ok := new(big.Rat).SetString(left.String())
-	if !ok {
-		return 0, fmt.Errorf("%w: invalid number %q", ErrInvalidConfig, left)
+	leftValue, err := parseConditionNumber(left)
+	if err != nil {
+		return 0, err
 	}
-	rightValue, ok := new(big.Rat).SetString(right.String())
-	if !ok {
-		return 0, fmt.Errorf("%w: invalid number %q", ErrInvalidConfig, right)
+	rightValue, err := parseConditionNumber(right)
+	if err != nil {
+		return 0, err
 	}
 	return leftValue.Cmp(rightValue), nil
+}
+
+// parseConditionNumber converts one preserved JSON number into an exact rational value.
+//
+// value must contain the original JSON number text. A failed conversion is returned without a public classification so
+// callers can distinguish invalid publication configuration from malformed activation business data.
+func parseConditionNumber(value json.Number) (*big.Rat, error) {
+	parsed, ok := new(big.Rat).SetString(value.String())
+	if !ok {
+		return nil, fmt.Errorf("invalid number %q", value)
+	}
+	return parsed, nil
 }
 
 // compareCollection applies one validated membership operator to decoded JSON primitive values.
@@ -615,16 +686,22 @@ func compareNumbers(left, right json.Number) (int, error) {
 // actual contains decoded JSON values and expected matches the operator's validated scalar or non-empty array
 // shape. Comparisons are type-strict and numeric values use exact decimal equality. A changed or malformed
 // expected shape returns ErrInvalidConfig rather than panicking.
-func compareCollection(actual []any, operator Operator, expected any) (bool, error) {
-	contains := func(candidate any) bool {
-		return slices.ContainsFunc(actual, func(value any) bool {
-			return equalPrimitive(value, candidate)
-		})
+func compareCollection(ctx context.Context, actual []any, operator Operator, expected any) (bool, error) {
+	contains := func(candidate any) (bool, error) {
+		for _, value := range actual {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+			if equalPrimitive(value, candidate) {
+				return true, nil
+			}
+		}
+		return false, nil
 	}
 
 	switch operator {
 	case OperatorContains:
-		return contains(expected), nil
+		return contains(expected)
 	case OperatorContainsAny, OperatorContainsAll:
 		// Multi-value membership requires the validated non-empty comparison array.
 	case OperatorEqual, OperatorNotEqual, OperatorStartsWith, OperatorEndsWith, OperatorGreaterThan,
@@ -638,9 +715,27 @@ func compareCollection(actual []any, operator Operator, expected any) (bool, err
 		return false, fmt.Errorf("%w: collection comparison value changed after validation", ErrInvalidConfig)
 	}
 	if operator == OperatorContainsAny {
-		return slices.ContainsFunc(expectedValues, contains), nil
+		for _, candidate := range expectedValues {
+			matched, err := contains(candidate)
+			if err != nil {
+				return false, err
+			}
+			if matched {
+				return true, nil
+			}
+		}
+		return false, nil
 	}
-	return !slices.ContainsFunc(expectedValues, func(candidate any) bool { return !contains(candidate) }), nil
+	for _, candidate := range expectedValues {
+		matched, err := contains(candidate)
+		if err != nil {
+			return false, err
+		}
+		if !matched {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // isPrimitive reports whether a decoded JSON value is supported as a collection member operand.

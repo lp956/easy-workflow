@@ -27,6 +27,8 @@ const (
 	auditInstanceReturned = "instance.returned"
 	// auditTaskTransferred is the stable action persisted before replacing one active assignment.
 	auditTaskTransferred = "task.transferred"
+	// reservedTaskCommandTransferred is the handler command suffix reserved by auditTaskTransferred.
+	reservedTaskCommandTransferred = "transferred"
 	// auditTaskActionPrefix namespaces accepted handler commands while preserving the handler-owned command name.
 	auditTaskActionPrefix = "task."
 )
@@ -294,9 +296,17 @@ func nodeTasks(tasks []Task, nodeID string) []Task {
 // advanceVersion increments the candidate's CAS token exactly once after every transition fact succeeds.
 //
 // executeInstanceCommand owns call timing and invokes this immediately before its single Save attempt. The method does
-// not persist or retry; a failed CAS discards the increment together with the rest of the private candidate.
-func (f *instanceFacts) advanceVersion() {
+// not persist or retry; a failed CAS discards the increment together with the rest of the private candidate. A maximum
+// uint64 token is rejected rather than wrapping to zero and reusing an older CAS value.
+func (f *instanceFacts) advanceVersion() error {
+	if f == nil || f.instance == nil {
+		return fmt.Errorf("%w: instance facts are incomplete", ErrInvalidStoreInput)
+	}
+	if f.instance.Version == ^uint64(0) {
+		return ErrVersionOverflow
+	}
 	f.instance.Version++
+	return nil
 }
 
 // newTaskID generates a process-independent task identifier using 128 random bits.

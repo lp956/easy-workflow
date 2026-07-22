@@ -7,8 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"slices"
 	"sync"
+
+	"github.com/lvpeng/easy-workflow/internal/jsonstrict"
 )
 
 var (
@@ -20,6 +23,8 @@ var (
 	ErrInstanceExists = errors.New("workflow: instance already exists")
 	// ErrVersionConflict means optimistic concurrency rejected a stale instance snapshot.
 	ErrVersionConflict = errors.New("workflow: version conflict")
+	// ErrVersionOverflow means an accepted transition cannot advance the uint64 instance CAS token.
+	ErrVersionOverflow = errors.New("workflow: version overflow")
 )
 
 // Store persists complete aggregate snapshots with optimistic concurrency.
@@ -66,7 +71,9 @@ func (s *MemoryStore) Create(ctx context.Context, instance *Instance) error {
 	}
 
 	// Hold the exclusive lock across lazy initialization, duplicate detection, and insertion.
-	s.mu.Lock()
+	if err := acquireMemoryStoreLock(ctx, s.mu.TryLock, s.mu.Unlock); err != nil {
+		return fmt.Errorf("workflow: create instance: %w", err)
+	}
 	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("workflow: create instance: %w", err)
@@ -101,7 +108,9 @@ func (s *MemoryStore) Load(ctx context.Context, id InstanceID) (*Instance, error
 	}
 
 	// Clone while holding the read lock so every field comes from one consistent stored pointer.
-	s.mu.RLock()
+	if err := acquireMemoryStoreLock(ctx, s.mu.TryRLock, s.mu.RUnlock); err != nil {
+		return nil, fmt.Errorf("workflow: load instance: %w", err)
+	}
 	defer s.mu.RUnlock()
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("workflow: load instance: %w", err)
@@ -134,7 +143,9 @@ func (s *MemoryStore) Save(ctx context.Context, instance *Instance, expectedVers
 	}
 
 	// Hold one exclusive lock across comparison and replacement so CAS is atomic for concurrent commands.
-	s.mu.Lock()
+	if err := acquireMemoryStoreLock(ctx, s.mu.TryLock, s.mu.Unlock); err != nil {
+		return fmt.Errorf("workflow: save instance: %w", err)
+	}
 	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("workflow: save instance: %w", err)
@@ -174,7 +185,28 @@ func cloneInstance(source *Instance) *Instance {
 	return &cloned
 }
 
+// acquireMemoryStoreLock waits for a lock without blocking past context cancellation.
+//
+// tryLock and unlock must refer to the same synchronization primitive. The loop yields between failed attempts so a
+// canceled caller can leave while another operation holds the mutex; the caller owns the successful unlock afterward.
+func acquireMemoryStoreLock(ctx context.Context, tryLock func() bool, unlock func()) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if tryLock() {
+			if err := ctx.Err(); err != nil {
+				unlock()
+				return err
+			}
+			return nil
+		}
+		// Yield rather than sleeping so short critical sections retain low latency without monopolizing a scheduler thread.
+		runtime.Gosched()
+	}
+}
+
 // validJSON reports whether optional raw data is either absent or one complete JSON value.
 func validJSON(data json.RawMessage) bool {
-	return len(data) == 0 || json.Valid(data)
+	return len(data) == 0 || jsonstrict.Validate(data) == nil
 }

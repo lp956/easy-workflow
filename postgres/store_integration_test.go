@@ -166,6 +166,68 @@ func TestStoreLoadsAfterPoolRestart(t *testing.T) {
 	assertIntegrationSnapshot(t, postgres.New(secondPool), instance)
 }
 
+// TestProjectionMigrationBackfillsLegacyInstances verifies 0003 upgrades command rows created before projections existed.
+func TestProjectionMigrationBackfillsLegacyInstances(t *testing.T) {
+	dsn := requireIntegrationDSN(t)
+	schema := createIsolatedSchema(t, dsn)
+	pool := openSchemaPool(t, dsn, schema)
+	applyMigrationFile(t, pool, "migrations/0001_init.up.sql")
+
+	definition := []byte(`{"id":"legacy-definition","version":7,"nodes":[],"edges":[]}`)
+	task := []byte(`{"id":"legacy-task","nodeId":"review","assignee":"reviewer","status":"active"}`)
+	started := []byte(`{"action":"instance.started","nodeId":"start","at":"2026-01-02T03:04:05Z"}`)
+	lastAudit := []byte(`{"action":"node.entered","nodeId":"review","at":"2026-01-02T04:04:05Z"}`)
+	if _, err := pool.Exec(t.Context(), `
+		INSERT INTO easy_workflow_instances (
+			id, definition, status, initiator, current_node_id, data, node_state,
+			tasks_is_nil, audit_is_nil, version
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		"legacy-instance", definition, workflow.InstanceStatusRunning, "initiator-a", "review", nil, nil, false, false, "1"); err != nil {
+		t.Fatalf("insert legacy instance error = %v", err)
+	}
+	if _, err := pool.Exec(t.Context(),
+		"INSERT INTO easy_workflow_tasks (instance_id, ordinal, task_id, status, payload) VALUES ($1, $2, $3, $4, $5)",
+		"legacy-instance", 0, "legacy-task", workflow.TaskStatusActive, task); err != nil {
+		t.Fatalf("insert legacy task error = %v", err)
+	}
+	for ordinal, payload := range [][]byte{started, lastAudit} {
+		if _, err := pool.Exec(t.Context(),
+			"INSERT INTO easy_workflow_audit (instance_id, ordinal, action, payload) VALUES ($1, $2, $3, $4)",
+			"legacy-instance", ordinal, []string{"instance.started", "node.entered"}[ordinal], payload); err != nil {
+			t.Fatalf("insert legacy audit %d error = %v", ordinal, err)
+		}
+	}
+
+	applyMigrationFile(t, pool, "migrations/0002_query_projection.up.sql")
+	applyMigrationFile(t, pool, "migrations/0003_query_projection_backfill.up.sql")
+
+	var definitionID, definitionVersion, status string
+	var startedAt, lastAuditAt, orderAt time.Time
+	if err := pool.QueryRow(t.Context(), `
+		SELECT definition_id, definition_version::text, instance_status, started_at, last_audit_at, order_at
+		FROM easy_workflow_instance_projection WHERE instance_id = $1`, "legacy-instance").Scan(
+		&definitionID, &definitionVersion, &status, &startedAt, &lastAuditAt, &orderAt,
+	); err != nil {
+		t.Fatalf("query backfilled instance projection error = %v", err)
+	}
+	if definitionID != "legacy-definition" || definitionVersion != "7" || status != string(workflow.InstanceStatusRunning) ||
+		!startedAt.Equal(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)) ||
+		!lastAuditAt.Equal(time.Date(2026, 1, 2, 4, 4, 5, 0, time.UTC)) || !orderAt.Equal(lastAuditAt) {
+		t.Fatalf("backfilled instance projection = %q/%q/%q %v/%v/%v, want legacy values", definitionID, definitionVersion, status, startedAt, lastAuditAt, orderAt)
+	}
+	var taskID, actorID, nodeID, taskStatus, outcome string
+	if err := pool.QueryRow(t.Context(), `
+		SELECT task_id, actor_id, node_id, task_status, outcome
+		FROM easy_workflow_participation_projection WHERE instance_id = $1`, "legacy-instance").Scan(
+		&taskID, &actorID, &nodeID, &taskStatus, &outcome,
+	); err != nil {
+		t.Fatalf("query backfilled participation projection error = %v", err)
+	}
+	if taskID != "legacy-task" || actorID != "reviewer" || nodeID != "review" || taskStatus != string(workflow.TaskStatusActive) || outcome != "" {
+		t.Fatalf("backfilled participation projection = %q/%q/%q/%q/%q, want legacy task values", taskID, actorID, nodeID, taskStatus, outcome)
+	}
+}
+
 // TestStorePreservesLosslessBoundaryValues verifies uint64 and nil-versus-empty snapshot fidelity.
 func TestStorePreservesLosslessBoundaryValues(t *testing.T) {
 	dsn := requireIntegrationDSN(t)
@@ -258,7 +320,9 @@ func createIsolatedSchema(t *testing.T, dsn string) string {
 		t.Fatalf("CREATE SCHEMA error = %v", err)
 	}
 	t.Cleanup(func() {
-		if _, err := admin.Exec(context.WithoutCancel(t.Context()), "DROP SCHEMA "+identifier+" CASCADE"); err != nil {
+		cleanupContext, cancelCleanup := context.WithTimeout(context.WithoutCancel(t.Context()), integrationCleanupTimeout)
+		defer cancelCleanup()
+		if _, err := admin.Exec(cleanupContext, "DROP SCHEMA "+identifier+" CASCADE"); err != nil {
 			t.Errorf("DROP SCHEMA error = %v", err)
 		}
 	})
@@ -316,6 +380,19 @@ func applyInitialMigration(t *testing.T, pool *pgxpool.Pool) {
 	// One setup call avoids per-migration database I/O while preserving SQL statement order in the combined text.
 	if _, err := pool.Exec(t.Context(), migrationSQL.String()); err != nil {
 		t.Fatalf("migration error = %v", err)
+	}
+}
+
+// applyMigrationFile executes one embedded migration file for upgrade-path tests that must control version order.
+func applyMigrationFile(t *testing.T, pool *pgxpool.Pool, path string) {
+	t.Helper()
+
+	data, err := fs.ReadFile(postgres.Migrations(), path)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", path, err)
+	}
+	if _, err := pool.Exec(t.Context(), string(data)); err != nil {
+		t.Fatalf("migration %q error = %v", path, err)
 	}
 }
 

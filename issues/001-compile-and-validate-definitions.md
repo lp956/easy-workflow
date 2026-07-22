@@ -6,7 +6,7 @@
 
 ## Parent
 
-[easy-workflow 产品需求文档](../PRD.md)
+[easy-workflow 项目说明](../README.md)
 
 ## What to build
 

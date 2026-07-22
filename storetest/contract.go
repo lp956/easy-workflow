@@ -61,6 +61,9 @@ func runCreateAndLoadContract(t *testing.T, factory Factory) {
 	if _, err := store.Load(t.Context(), "missing-instance"); !errors.Is(err, workflow.ErrInstanceNotFound) {
 		t.Fatalf("missing Load() error = %v, want ErrInstanceNotFound", err)
 	}
+	if err := store.Save(t.Context(), contractInstance("missing-instance", 2), 1); !errors.Is(err, workflow.ErrInstanceNotFound) {
+		t.Fatalf("Save(missing instance) error = %v, want ErrInstanceNotFound", err)
+	}
 }
 
 // runSnapshotOwnershipContract verifies that Create, Load, and Save never share caller-mutable storage.

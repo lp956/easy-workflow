@@ -172,7 +172,7 @@ func (e *Engine) Handle(ctx context.Context, command Command) (*Instance, error)
 				return err
 			}
 			result, err := handler.HandlePrepared(ctx, PreparedCommandInput{
-				Command: command,
+				Command: cloneCommand(command),
 				Data:    slices.Clone(snapshot.Data),
 				State:   slices.Clone(snapshot.NodeState),
 				Tasks:   tasks,
@@ -469,7 +469,9 @@ func (e *Engine) executeInstanceCommand(
 	if err := command.transition(facts); err != nil {
 		return nil, err
 	}
-	facts.advanceVersion()
+	if err := facts.advanceVersion(); err != nil {
+		return nil, err
+	}
 
 	// One aggregate CAS commits every task, state, audit, status, and version change or none of them.
 	if err := e.store.Save(ctx, facts.candidate(), expectedVersion); err != nil {
@@ -504,6 +506,10 @@ func (e *Engine) validateCommand(command Command) error {
 	// All four identities jointly bind the command to one task, actor, and handler operation.
 	if command.InstanceID == "" || command.TaskID == "" || command.ActorID == "" || command.Name == "" {
 		return fmt.Errorf("%w: required command field is empty", ErrInvalidCommand)
+	}
+	// Handler command names share the task audit namespace, so the lifecycle transfer action must remain reserved.
+	if command.Name == reservedTaskCommandTransferred {
+		return fmt.Errorf("%w: command name %q is reserved", ErrInvalidCommand, command.Name)
 	}
 	// Invalid JSON cannot be delegated because handlers own schema validation only after syntax is trustworthy.
 	if !validJSON(command.Payload) {

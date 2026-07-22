@@ -39,3 +39,36 @@ func TestDecodeRejectsInvalidUTF8(t *testing.T) {
 		t.Fatalf("Decode(invalid UTF-8) error = %v, want ErrInvalid", err)
 	}
 }
+
+// TestValidateRejectsUnpairedSurrogateEscapes verifies escaped UTF-16 values cannot be silently normalized.
+func TestValidateRejectsUnpairedSurrogateEscapes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		data string
+		want bool
+	}{
+		{name: "lone high", data: `{"value":"\uD800"}`, want: false},
+		{name: "lone low", data: `{"value":"\uDC00"}`, want: false},
+		{name: "mismatched pair", data: `{"value":"\uD800\uD800"}`, want: false},
+		{name: "valid pair", data: `{"value":"\uD83D\uDE00"}`, want: true},
+		{name: "surrogate object key", data: `{"\uD800":"value"}`, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := jsonstrict.Validate([]byte(test.data))
+			if test.want {
+				if err != nil {
+					t.Fatalf("Validate() error = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, jsonstrict.ErrInvalid) {
+				t.Fatalf("Validate() error = %v, want ErrInvalid", err)
+			}
+		})
+	}
+}

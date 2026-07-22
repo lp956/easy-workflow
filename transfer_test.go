@@ -69,6 +69,66 @@ func startTransferableInstance(
 	return engine, instance
 }
 
+// TestEngineReservesTransferAuditCommandName verifies handler commands cannot collide with lifecycle audit actions.
+func TestEngineReservesTransferAuditCommandName(t *testing.T) {
+	t.Parallel()
+
+	store := workflow.NewMemoryStore()
+	engine, started := startTransferableInstance(t, store, "reserved-transfer-command", approval.ModeAny, []workflow.ActorID{"reviewer-a"})
+	_, err := engine.Handle(t.Context(), workflow.Command{
+		InstanceID: started.ID,
+		TaskID:     started.Tasks[0].ID,
+		ActorID:    started.Tasks[0].Assignee,
+		Name:       "transferred",
+	})
+	if !errors.Is(err, workflow.ErrInvalidCommand) {
+		t.Fatalf("Handle(reserved command) error = %v, want ErrInvalidCommand", err)
+	}
+	after, err := store.Load(t.Context(), started.ID)
+	if err != nil {
+		t.Fatalf("Load(after reserved command) error = %v", err)
+	}
+	if !reflect.DeepEqual(after, started) {
+		t.Fatalf("instance changed after reserved command: got %#v, want %#v", after, started)
+	}
+}
+
+// TestEngineRejectsInstanceVersionOverflow verifies the CAS token never wraps from MaxUint64 to zero.
+func TestEngineRejectsInstanceVersionOverflow(t *testing.T) {
+	t.Parallel()
+
+	store := workflow.NewMemoryStore()
+	engine, started := startTransferableInstance(t, store, "version-overflow", approval.ModeAny, []workflow.ActorID{"reviewer-a"})
+	maximum := ^uint64(0)
+	candidate, err := store.Load(t.Context(), started.ID)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	candidate.Version = maximum
+	if err := store.Save(t.Context(), candidate, started.Version); err != nil {
+		t.Fatalf("Save(maximum version) error = %v", err)
+	}
+	_, err = engine.Transfer(t.Context(), workflow.TransferRequest{
+		InstanceID:  started.ID,
+		TaskID:      started.Tasks[0].ID,
+		ActorID:     "operator-a",
+		NewAssignee: "reviewer-b",
+		Reason:      "version boundary",
+	}, transferPolicyFunc(func(context.Context, workflow.TransferRequest, workflow.Task, *workflow.Instance) error {
+		return nil
+	}))
+	if !errors.Is(err, workflow.ErrVersionOverflow) {
+		t.Fatalf("Transfer() error = %v, want ErrVersionOverflow", err)
+	}
+	persisted, err := store.Load(t.Context(), started.ID)
+	if err != nil {
+		t.Fatalf("Load(after overflow) error = %v", err)
+	}
+	if persisted.Version != maximum || !reflect.DeepEqual(persisted.Tasks, candidate.Tasks) {
+		t.Fatalf("persisted snapshot after overflow = version %d tasks %#v, want version %d tasks %#v", persisted.Version, persisted.Tasks, maximum, candidate.Tasks)
+	}
+}
+
 // TestEngineTransfersActiveOrSignTask verifies an authorized transfer replaces ownership with a new assignment.
 func TestEngineTransfersActiveOrSignTask(t *testing.T) {
 	t.Parallel()

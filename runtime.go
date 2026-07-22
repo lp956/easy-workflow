@@ -5,6 +5,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"time"
 )
 
@@ -190,12 +191,19 @@ type TransferPolicy interface {
 
 // Command asks the handler for the current node to process one task action.
 //
-// Name is a stable handler-defined command such as "approve". Payload is optional JSON owned by that
-// handler. The engine verifies instance and task ownership before committing the returned NodeResult.
+// Name is a stable handler-defined command such as "approve". Payload is optional JSON delivered to the handler as a
+// defensive copy. The engine verifies instance and task ownership before committing the returned NodeResult.
 type Command struct {
 	InstanceID InstanceID      `json:"instanceId"`
 	TaskID     TaskID          `json:"taskId"`
 	ActorID    ActorID         `json:"actorId"`
 	Name       string          `json:"name"`
 	Payload    json.RawMessage `json:"payload,omitempty"`
+}
+
+// cloneCommand detaches the optional JSON payload before a command crosses a handler boundary.
+func cloneCommand(source Command) Command {
+	cloned := source
+	cloned.Payload = slices.Clone(source.Payload)
+	return cloned
 }

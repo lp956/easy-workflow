@@ -76,7 +76,7 @@ func (h *legacyPreparedNodeHandler) HandlePrepared(
 	input PreparedCommandInput,
 ) (NodeResult, error) {
 	result, err := h.handler.Handle(ctx, CommandInput{
-		Command: input.Command,
+		Command: cloneCommand(input.Command),
 		Config:  slices.Clone(h.config),
 		Data:    slices.Clone(input.Data),
 		State:   slices.Clone(input.State),

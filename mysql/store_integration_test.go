@@ -23,7 +23,11 @@ import (
 	"github.com/lvpeng/easy-workflow/storetest"
 )
 
-const integrationDSNEnvironment = "EASY_WORKFLOW_MYSQL_DSN"
+const (
+	integrationDSNEnvironment = "EASY_WORKFLOW_MYSQL_DSN"
+	// integrationCleanupTimeout bounds database cleanup after a failed connection attempt or test cancellation.
+	integrationCleanupTimeout = 5 * time.Second
+)
 
 // TestStoreContract applies the shared adapter contract to isolated MySQL databases.
 func TestStoreContract(t *testing.T) {
@@ -273,13 +277,15 @@ func newIsolatedStoreAndDB(t *testing.T, dsn string) (workflow.Store, *sql.DB) {
 	}
 	if err := db.PingContext(t.Context()); err != nil {
 		db.Close()
-		_, _ = adminDB.ExecContext(context.WithoutCancel(t.Context()), "DROP DATABASE "+identifier)
+		cleanupContext, cancelCleanup := context.WithTimeout(context.WithoutCancel(t.Context()), integrationCleanupTimeout)
+		_, _ = adminDB.ExecContext(cleanupContext, "DROP DATABASE "+identifier)
+		cancelCleanup()
 		adminDB.Close()
 		t.Fatalf("PingContext() error = %v", err)
 	}
 	t.Cleanup(func() {
 		db.Close()
-		cleanupContext, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
+		cleanupContext, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), integrationCleanupTimeout)
 		defer cancel()
 		if _, err := adminDB.ExecContext(cleanupContext, "DROP DATABASE "+identifier); err != nil {
 			t.Errorf("DROP DATABASE error = %v", err)

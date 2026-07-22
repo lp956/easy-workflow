@@ -1,0 +1,2 @@
+-- The backfill is intentionally irreversible: projection rows do not retain whether they were migrated or written later.
+-- Hosts may remove all query projection artifacts with 0002_query_projection.down.sql when the feature is retired.

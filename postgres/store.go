@@ -85,23 +85,23 @@ func (s *Store) Create(ctx context.Context, instance *workflow.Instance) error {
 	err = withTransaction(ctx, s.pool, pgx.TxOptions{}, func(tx pgx.Tx) error {
 		if _, execErr := tx.Exec(ctx, insertInstanceSQL, snapshot.parentArguments()...); execErr != nil {
 			if isDuplicateInstanceError(execErr) {
-				return fmt.Errorf("%w: %q", workflow.ErrInstanceExists, instance.ID)
+				return fmt.Errorf("%w: %q", workflow.ErrInstanceExists, snapshot.aggregate.ID)
 			}
 			return fmt.Errorf("insert instance row: %w", execErr)
 		}
-		if copyErr := copyTasks(ctx, tx, instance.ID, snapshot.tasks); copyErr != nil {
+		if copyErr := copyTasks(ctx, tx, snapshot.aggregate.ID, snapshot.tasks); copyErr != nil {
 			return copyErr
 		}
-		if copyErr := copyAudit(ctx, tx, instance.ID, snapshot.audit, 0); copyErr != nil {
+		if copyErr := copyAudit(ctx, tx, snapshot.aggregate.ID, snapshot.audit, 0); copyErr != nil {
 			return copyErr
 		}
-		if projectionErr := replaceQueryProjection(ctx, tx, instance); projectionErr != nil {
+		if projectionErr := replaceQueryProjection(ctx, tx, &snapshot.aggregate); projectionErr != nil {
 			return projectionErr
 		}
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("postgres: create instance %q: %w", instance.ID, err)
+		return fmt.Errorf("postgres: create instance %q: %w", snapshot.aggregate.ID, err)
 	}
 	return nil
 }
@@ -164,22 +164,22 @@ func (s *Store) Save(ctx context.Context, instance *workflow.Instance, expectedV
 			return fmt.Errorf("conditionally update instance row: %w", execErr)
 		}
 		if tag.RowsAffected() == 0 {
-			return classifyFailedCAS(ctx, tx, instance.ID)
+			return classifyFailedCAS(ctx, tx, snapshot.aggregate.ID)
 		}
-		auditOffset, auditErr := validateAuditAppend(ctx, tx, instance.ID, instance.Audit)
+		auditOffset, auditErr := validateAuditAppend(ctx, tx, snapshot.aggregate.ID, snapshot.aggregate.Audit)
 		if auditErr != nil {
 			return auditErr
 		}
-		if replaceErr := replaceCollections(ctx, tx, instance.ID, snapshot, auditOffset); replaceErr != nil {
+		if replaceErr := replaceCollections(ctx, tx, snapshot.aggregate.ID, snapshot, auditOffset); replaceErr != nil {
 			return replaceErr
 		}
-		if projectionErr := replaceQueryProjection(ctx, tx, instance); projectionErr != nil {
+		if projectionErr := replaceQueryProjection(ctx, tx, &snapshot.aggregate); projectionErr != nil {
 			return projectionErr
 		}
 		return nil
 	})
 	if err != nil {
-		return fmt.Errorf("postgres: save instance %q: %w", instance.ID, err)
+		return fmt.Errorf("postgres: save instance %q: %w", snapshot.aggregate.ID, err)
 	}
 	return nil
 }
